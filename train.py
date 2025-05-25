@@ -53,8 +53,8 @@ wandb_run_name = "gpt2"  # 'run' + str(time.time())
 dataset = "openwebtext"
 gradient_accumulation_steps = 5 * 8  # used to simulate larger batch sizes
 batch_size = 12  # if gradient_accumulation_steps > 1, this is the micro-batch size
+# model - 124M GPT-2
 block_size = 1024
-# model
 n_layer = 12
 n_head = 12
 n_embd = 768
@@ -307,7 +307,6 @@ if wandb_log and master_process:
 
 # training loop
 X, Y = get_batch("train")  # fetch the very first batch
-t0 = time.time()
 local_iter_num = 0  # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model  # unwrap DDP container if needed
 running_mfu = -1.0
@@ -350,9 +349,14 @@ while True:
     if iter_num == 0 and eval_only:
         break
 
+    t0 = time.time()
     # Add the attention head splitting
     # The idea is that we only backprop through and train only one half of the attention heads
     # and in the next iteration we train the other half
+
+    # if iter_num % 100 == 0:
+    #     for block in model.transformer.h:
+    #         block.attn.randomize_trainable_heads(2)
 
     # forward backward update, with optional gradient accumulation to simulate larger batch size
     # and using the GradScaler if data type is float16
@@ -387,7 +391,6 @@ while True:
     # timing and logging
     t1 = time.time()
     dt = t1 - t0
-    t0 = t1
     if iter_num % log_interval == 0 and master_process:
         # get loss as float. note: this is a CPU-GPU sync point
         # scale up to undo the division above, approximating the true total loss (exact would have been a sum)

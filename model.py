@@ -28,6 +28,269 @@ class LayerNorm(nn.Module):
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
 
+# class ImprovedSplitCausalSelfAttentionVariableNumHeadsIndependent(nn.Module):
+
+#     def __init__(self, config):
+#         super().__init__()
+#         assert config.n_embd % config.n_head == 0
+#         # key, query, value projections for all heads, but in a batch
+
+#         # self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+#         # # output projection
+#         # self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+
+#         # regularization
+#         self.attn_dropout = nn.Dropout(config.dropout)
+#         self.resid_dropout = nn.Dropout(config.dropout)
+#         self.n_head = config.n_head
+#         self.n_embd = config.n_embd
+#         self.head_dim = config.n_embd // config.n_head
+#         self.dropout = config.dropout
+#         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
+#         self.flash = hasattr(torch.nn.functional, "scaled_dot_product_attention")
+#         if not self.flash:
+#             print(
+#                 "WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0"
+#             )
+#             # causal mask to ensure that attention is only applied to the left in the input sequence
+#             self.register_buffer(
+#                 "bias",
+#                 torch.tril(torch.ones(config.block_size, config.block_size)).view(
+#                     1, 1, config.block_size, config.block_size
+#                 ),
+#             )
+
+#         # per-head projection weights: [num_heads, head_dim, embed_dim]
+#         self.q_weight = nn.Parameter(
+#             torch.Tensor(self.n_head, self.head_dim, self.n_embd)
+#         )
+#         self.k_weight = nn.Parameter(
+#             torch.Tensor(self.n_head, self.head_dim, self.n_embd)
+#         )
+#         self.v_weight = nn.Parameter(
+#             torch.Tensor(self.n_head, self.head_dim, self.n_embd)
+#         )
+
+#         self.out_weight = nn.Parameter(
+#             torch.Tensor(self.n_head, self.head_dim, self.n_embd)
+#         )
+
+#         self.initialise_weights()
+
+#         # initialise the first half of the heads as trainable, counting from 0
+#         # self.trainable_heads = list(range(config.n_head // 2))
+#         self.trainable_heads = torch.tensor([0, 1]).long()
+#         self.use_all_heads = False
+
+#     def initialise_weights(self):
+#         nn.init.xavier_uniform_(self.q_weight)
+#         nn.init.xavier_uniform_(self.k_weight)
+#         nn.init.xavier_uniform_(self.v_weight)
+#         nn.init.xavier_uniform_(self.out_weight)
+
+#     def randomize_trainable_heads(self, num_heads: int):
+#         """
+#         Randomize the trainable heads.
+#         Args:
+#             num_heads (int): Number of heads to randomize.
+#         """
+#         self.trainable_heads = torch.randperm(self.n_head).tolist()[:num_heads]
+
+#     def set_trainable_heads(self, trainable_heads: list[int]):
+#         """
+#         Set the trainable heads to the given list of heads.
+#         Args:
+#             trainable_heads (list[int]): List of head ids to be trainable.
+#         """
+#         self.trainable_heads = torch.Tensor(sorted(trainable_heads)).long()
+
+#     def forward(self, x):
+#         B, T, C  = (
+#             x.size()
+#         )  # batch size, sequence length, embedding dimensionality (n_embd)
+
+#         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+#         # heads = self.c_attn.weight.split(self.n_embd // 3 // self.n_head, dim=0)
+
+#         wq = self.q_weight[self.trainable_heads]  # [H, D, E]
+#         wk = self.k_weight[self.trainable_heads]
+#         wv = self.v_weight[self.trainable_heads]
+
+#         q = torch.einsum("ble,hde->bhld", x, wq)
+#         k = torch.einsum("ble,hde->bhld", x, wk)
+#         v = torch.einsum("ble,hde->bhld", x, wv)
+
+#         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
+#         if self.flash:
+#             # efficient attention using Flash Attention CUDA kernels
+#             y = torch.nn.functional.scaled_dot_product_attention(
+#                 q,
+#                 k,
+#                 v,
+#                 attn_mask=None,
+#                 dropout_p=self.dropout if self.training else 0,
+#                 is_causal=True,
+#             )
+#         else:
+#             # manual implementation of attention
+#             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+#             att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
+#             att = F.softmax(att, dim=-1)
+#             att = self.attn_dropout(att)
+#             y = att @ v  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+#         y = (
+#             y.transpose(1, 2)
+#             .contiguous()
+#             .view(B, T, len(self.trainable_heads), self.head_dim)
+#         )  # re-assemble all head outputs side by side -> (B, T, n_heads, head_dim)
+
+#         wo = self.out_weight[self.trainable_heads]
+#         out = torch.einsum("blhd,hdm->blm", y, wo)
+
+#         return self.resid_dropout(out)  # (B, T, n_embd)
+
+
+class SplitCausalSelfAttentionVariableNumHeadsIndependent(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        assert config.n_embd % config.n_head == 0
+        # key, query, value projections for all heads, but in a batch
+
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        # output projection
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+
+        # regularization
+        self.attn_dropout = nn.Dropout(config.dropout)
+        self.resid_dropout = nn.Dropout(config.dropout)
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+        self.head_dim = config.n_embd // config.n_head
+        self.dropout = config.dropout
+        # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
+        self.flash = hasattr(torch.nn.functional, "scaled_dot_product_attention")
+        if not self.flash:
+            print(
+                "WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0"
+            )
+            # causal mask to ensure that attention is only applied to the left in the input sequence
+            self.register_buffer(
+                "bias",
+                torch.tril(torch.ones(config.block_size, config.block_size)).view(
+                    1, 1, config.block_size, config.block_size
+                ),
+            )
+
+        # initialise the first half of the heads as trainable, counting from 0
+        # self.trainable_heads = list(range(config.n_head // 2))
+        self.trainable_heads = [0, 1]
+
+    def randomize_trainable_heads(self, num_heads: int):
+        """
+        Randomize the trainable heads.
+        Args:
+            num_heads (int): Number of heads to randomize.
+        """
+        self.trainable_heads = torch.randperm(self.n_head).tolist()[:num_heads]
+
+    def set_trainable_heads(self, trainable_heads: list[int]):
+        """
+        Set the trainable heads to the given list of heads.
+        Args:
+            trainable_heads (list[int]): List of head ids to be trainable.
+        """
+        self.trainable_heads = sorted(trainable_heads)
+
+    def get_non_trainable_heads(self):
+        return sorted(list(set(range(self.n_head)) - set(self.trainable_heads)))
+
+    def forward(self, x):
+        B, T, C = (
+            x.size()
+        )  # batch size, sequence length, embedding dimensionality (n_embd)
+
+        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        # heads = self.c_attn.weight.split(self.n_embd // 3 // self.n_head, dim=0)
+
+        trainable_w = torch.cat(
+            [
+                self.c_attn.weight[
+                    i * self.n_embd
+                    + j * self.head_dim : i * self.n_embd
+                    + (j + 1) * self.head_dim,
+                    :,
+                ]
+                for j in self.trainable_heads
+                for i in range(3)
+            ]
+        )
+
+        output_t = x @ trainable_w.T
+
+        split_t = iter(output_t.split(self.head_dim, dim=2))
+
+        q = []
+        k = []
+        v = []
+        for _ in sorted(self.trainable_heads):
+            q.append(next(split_t))
+            k.append(next(split_t))
+            v.append(next(split_t))
+
+        q = torch.cat(q, dim=2)
+        k = torch.cat(k, dim=2)
+        v = torch.cat(v, dim=2)
+
+        k = k.view(B, T, len(self.trainable_heads), self.head_dim).transpose(
+            1, 2
+        )  # (B, nh, T, hs)
+        q = q.view(B, T, len(self.trainable_heads), self.head_dim).transpose(
+            1, 2
+        )  # (B, nh, T, hs)
+        v = v.view(B, T, len(self.trainable_heads), self.head_dim).transpose(
+            1, 2
+        )  # (B, nh, T, hs)
+
+        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
+        if self.flash:
+            # efficient attention using Flash Attention CUDA kernels
+            y = torch.nn.functional.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=None,
+                dropout_p=self.dropout if self.training else 0,
+                is_causal=True,
+            )
+        else:
+            # manual implementation of attention
+            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+            att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
+            att = F.softmax(att, dim=-1)
+            att = self.attn_dropout(att)
+            y = att @ v  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        y = (
+            y.transpose(1, 2)
+            .contiguous()
+            .view(B, T, len(self.trainable_heads) * self.head_dim)
+        )  # re-assemble all head outputs side by side -> (B, T, n_embd)
+        trainable_o = torch.cat(
+            [
+                self.c_proj.weight[
+                    :,
+                    j * self.head_dim : (j + 1) * self.head_dim,
+                ]
+                for j in self.trainable_heads
+            ],
+            dim=-1,
+        )
+
+        y = self.resid_dropout(y @ trainable_o.T)
+
+        return y
+
+
 class SplitCausalSelfAttentionVariableNumHeads(nn.Module):
 
     def __init__(self, config):
