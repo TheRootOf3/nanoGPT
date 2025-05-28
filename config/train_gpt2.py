@@ -2,7 +2,6 @@
 # launch as the following (e.g. in a screen session) and wait ~5 days:
 # $ torchrun --standalone --nproc_per_node=8 train.py config/train_gpt2.py
 
-from model import CausalSelfAttention, SplitCausalSelfAttentionVariableNumHeads
 
 wandb_log = True
 wandb_project = "owt"
@@ -15,8 +14,11 @@ block_size = 1024
 gradient_accumulation_steps = 5 * 1
 
 # this makes total number of tokens be 300B
-max_iters = 10_000
-lr_decay_iters = 10_000
+# max_iters = 10_000
+# lr_decay_iters = 10_000
+
+max_iters = 500
+lr_decay_iters = 500
 
 # eval stuff
 eval_interval = 200
@@ -27,7 +29,7 @@ log_interval = 10
 weight_decay = 1e-1
 compile = False
 
-# attention_layer = CausalSelfAttention
-attention_layer = SplitCausalSelfAttentionVariableNumHeads
+attention_layer = "causal"
+# attention_layer = "selective"
 
-learning_rate = 6e-3  # max learning rate
+learning_rate = 6e-4  # max learning rate

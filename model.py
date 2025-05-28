@@ -202,9 +202,6 @@ class SplitCausalSelfAttentionVariableNumHeadsIndependent(nn.Module):
         """
         self.trainable_heads = sorted(trainable_heads)
 
-    def get_non_trainable_heads(self):
-        return sorted(list(set(range(self.n_head)) - set(self.trainable_heads)))
-
     def forward(self, x):
         B, T, C = (
             x.size()
@@ -583,8 +580,13 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
+        self.output_attentions = config.output_attentions
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
-        self.flash = hasattr(torch.nn.functional, "scaled_dot_product_attention")
+        if self.output_attentions:
+            self.flash = False
+        else:
+            self.flash = hasattr(torch.nn.functional, "scaled_dot_product_attention")
+
         if not self.flash:
             print(
                 "WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0"
@@ -638,7 +640,12 @@ class CausalSelfAttention(nn.Module):
 
         # output projection
         y = self.resid_dropout(self.c_proj(y))
-        return y
+
+        attn_weights = None
+        if self.output_attentions:
+            attn_weights = att
+
+        return y, attn_weights
 
 
 class MLP(nn.Module):
@@ -669,9 +676,10 @@ class Block(nn.Module):
         self.mlp = MLP(config)
 
     def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
+        attn_outputs, attn_weights = self.attn(self.ln_1(x))
+        x = x + attn_outputs
         x = x + self.mlp(self.ln_2(x))
-        return x
+        return x, attn_weights
 
 
 @dataclass
@@ -689,6 +697,10 @@ class GPTConfig:
     )
     # attention_layer: nn.Module = SplitCausalSelfAttention
     attention_layer: nn.Module = CausalSelfAttention
+    output_attentions: bool = (
+        False  # whether to return attention weights in the forward pass.
+        # Note that this will change the attention implementation to eager instead of flash.
+    )
 
 
 class GPT(nn.Module):
@@ -761,8 +773,11 @@ class GPT(nn.Module):
         tok_emb = self.transformer.wte(idx)  # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos)  # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
+        attn_weights_lst = []
         for block in self.transformer.h:
-            x = block(x)
+            x, attn_weights = block(x)
+            if attn_weights is not None:
+                attn_weights_lst.append(attn_weights.detach())
         x = self.transformer.ln_f(x)
 
         if targets is not None:
@@ -777,6 +792,9 @@ class GPT(nn.Module):
                 x[:, [-1], :]
             )  # note: using list [-1] to preserve the time dim
             loss = None
+
+        if self.config.output_attentions:
+            return logits, loss, attn_weights_lst
 
         return logits, loss
 

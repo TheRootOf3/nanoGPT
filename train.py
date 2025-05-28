@@ -30,9 +30,8 @@ from torch.distributed import init_process_group, destroy_process_group
 from model import (
     GPTConfig,
     GPT,
-    SplitCausalSelfAttention,
     CausalSelfAttention,
-    SplitCausalSelfAttentionVariableNumHeads,
+    SplitCausalSelfAttentionVariableNumHeadsIndependent,
 )
 
 # -----------------------------------------------------------------------------
@@ -84,7 +83,7 @@ dtype = (
     else "float16"
 )  # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = True  # use PyTorch 2.0 to compile the model to be faster
-attention_layer = CausalSelfAttention  # or SplitCausalSelfAttentionVariableNumHeads
+attention_layer = "causal"  # 'selective'
 
 # -----------------------------------------------------------------------------
 config_keys = [
@@ -93,6 +92,20 @@ config_keys = [
     if not k.startswith("_") and isinstance(v, (int, float, bool, str))
 ]
 exec(open("configurator.py").read())  # overrides from command line or config file
+
+attention_layer_type = (
+    CausalSelfAttention
+    if attention_layer == "causal"
+    else (
+        SplitCausalSelfAttentionVariableNumHeadsIndependent
+        if attention_layer == "selective"
+        else None
+    )
+)
+assert (
+    attention_layer_type is not None
+), f"unknown attention layer type: {attention_layer}"
+
 config = {k: globals()[k] for k in config_keys}  # will be useful for logging
 # -----------------------------------------------------------------------------
 
@@ -192,7 +205,7 @@ model_args = dict(
     bias=bias,
     vocab_size=None,
     dropout=dropout,
-    attention_layer=attention_layer,
+    attention_layer=attention_layer_type,
 )  # start with model_args from command line
 if init_from == "scratch":
     # init a new model from scratch
@@ -345,7 +358,7 @@ while True:
                     "config": config,
                 }
                 print(f"saving checkpoint to {out_dir}")
-                torch.save(checkpoint, os.path.join(out_dir, "ckpt.pt"))
+                torch.save(checkpoint, os.path.join(out_dir, f"ckpt_{iter_num}.pt"))
     if iter_num == 0 and eval_only:
         break
 
@@ -354,9 +367,9 @@ while True:
     # The idea is that we only backprop through and train only one half of the attention heads
     # and in the next iteration we train the other half
 
-    # if iter_num % 100 == 0:
+    # if iter_num % 1999 == 0:
     #     for block in model.transformer.h:
-    #         block.attn.randomize_trainable_heads(2)
+    #         block.attn.randomize_trainable_heads(4)
 
     # forward backward update, with optional gradient accumulation to simulate larger batch size
     # and using the GradScaler if data type is float16
