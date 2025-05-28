@@ -33,6 +33,11 @@ from model import (
     CausalSelfAttention,
     SplitCausalSelfAttentionVariableNumHeadsIndependent,
 )
+from attention_head_similarity import (
+    aggregate_head_pairwise_metric_batch,
+    cosine_similarity,
+    cka,
+)
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -84,6 +89,7 @@ dtype = (
 )  # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = True  # use PyTorch 2.0 to compile the model to be faster
 attention_layer = "causal"  # 'selective'
+output_attentions = False  # whether to output attention weights for each block
 
 # -----------------------------------------------------------------------------
 config_keys = [
@@ -206,6 +212,7 @@ model_args = dict(
     vocab_size=None,
     dropout=dropout,
     attention_layer=attention_layer_type,
+    output_attentions=output_attentions,
 )  # start with model_args from command line
 if init_from == "scratch":
     # init a new model from scratch
@@ -296,6 +303,30 @@ def estimate_loss():
     return out
 
 
+# helps estimate an arbitrarily accurate loss over either split using many batches
+@torch.no_grad()
+def estimate_attention_head_similarity():
+    out = {}
+    model.eval()
+    # compute CKA for each block
+    n_blocks = gptconf.n_layer  # number of blocks in the model
+    cka_results = [[] for _ in range(n_blocks)]
+    for k in range(3):
+        X, Y = get_batch("val")
+        with ctx:
+            _, _, attn_weights = model(X, Y, output_attentions=True)
+        for block_idx in range(n_blocks):
+            cka_results[block_idx].extend(
+                aggregate_head_pairwise_metric_batch(
+                    attn_weights[block_idx],
+                    cka,
+                )
+            )
+    out["cka_per_block"] = np.mean(cka_results, axis=1)
+    model.train()
+    return out
+
+
 # learning rate decay scheduler (cosine with warmup)
 def get_lr(it):
     # 1) linear warmup for warmup_iters steps
@@ -333,32 +364,38 @@ while True:
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
+        attn = estimate_attention_head_similarity()
         print(
             f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}"
         )
         if wandb_log:
-            wandb.log(
+            log_data = {
+                "iter": iter_num,
+                "train/loss_est": losses["train"],
+                "val/loss_est": losses["val"],
+                "lr": lr,
+                "mfu": running_mfu * 100,  # convert to percentage
+            }
+            log_data.update(
                 {
-                    "iter": iter_num,
-                    "train/loss_est": losses["train"],
-                    "val/loss_est": losses["val"],
-                    "lr": lr,
-                    "mfu": running_mfu * 100,  # convert to percentage
+                    f"val/cka_block_{i}": attn["cka_per_block"][i]
+                    for i in range(len(attn["cka_per_block"]))
                 }
             )
-        if losses["val"] < best_val_loss or always_save_checkpoint:
+            wandb.log(log_data)
+
+        if always_save_checkpoint:
             best_val_loss = losses["val"]
-            if iter_num > 0:
-                checkpoint = {
-                    "model": raw_model.state_dict(),
-                    "optimizer": optimizer.state_dict(),
-                    "model_args": model_args,
-                    "iter_num": iter_num,
-                    "best_val_loss": best_val_loss,
-                    "config": config,
-                }
-                print(f"saving checkpoint to {out_dir}")
-                torch.save(checkpoint, os.path.join(out_dir, f"ckpt_{iter_num}.pt"))
+            checkpoint = {
+                "model": raw_model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "model_args": model_args,
+                "iter_num": iter_num,
+                "best_val_loss": best_val_loss,
+                "config": config,
+            }
+            print(f"saving checkpoint to {out_dir}")
+            torch.save(checkpoint, os.path.join(out_dir, f"ckpt_{iter_num}.pt"))
     if iter_num == 0 and eval_only:
         break
 
@@ -370,6 +407,16 @@ while True:
     # if iter_num % 1999 == 0:
     #     for block in model.transformer.h:
     #         block.attn.randomize_trainable_heads(4)
+
+    if iter_num == 1000:
+        for block in model.transformer.h:
+            block.attn.copy_heads([0], [1])
+            block.attn.set_trainable_heads([0, 1])
+
+    if iter_num == 2000:
+        for block in model.transformer.h:
+            block.attn.copy_heads([0, 1], [2, 3])
+            block.attn.set_trainable_heads([0, 1, 2, 3])
 
     # forward backward update, with optional gradient accumulation to simulate larger batch size
     # and using the GradScaler if data type is float16
