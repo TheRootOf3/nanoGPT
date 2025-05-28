@@ -7,18 +7,17 @@ wandb_log = True
 wandb_project = "owt"
 wandb_run_name = "gpt2-124M"
 
-# these make the total batch size be ~0.5M
-# 12 batch size * 1024 block size * 5 gradaccum * 8 GPUs = 491,520
+
 batch_size = 16
 block_size = 1024
-gradient_accumulation_steps = 5 * 1
+gradient_accumulation_steps = 5 * 4
 
-# this makes total number of tokens be 300B
-# max_iters = 10_000
-# lr_decay_iters = 10_000
+# this makes total number of tokens be 3B with 4 GPUs
+max_iters = 10_000
+lr_decay_iters = 10_000
 
-max_iters = 500
-lr_decay_iters = 500
+# max_iters = 500
+# lr_decay_iters = 500
 
 # eval stuff
 eval_interval = 200
@@ -33,3 +32,4 @@ attention_layer = "causal"
 # attention_layer = "selective"
 
 learning_rate = 6e-4  # max learning rate
+always_save_checkpoint = False

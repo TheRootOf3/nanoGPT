@@ -7,6 +7,8 @@ wandb_log = True
 wandb_project = "owt"
 wandb_run_name = "gpt2-124M"
 
+out_dir = "out-split-gpt2-16m"
+
 # model - 16M GPT-2
 block_size = 512
 n_layer = 4
@@ -33,7 +35,9 @@ log_interval = 10
 weight_decay = 1e-1
 compile = False
 
-attention_layer = "causal"
-# attention_layer = "selective"
+# attention_layer = "causal"
+attention_layer = "selective"
+
+always_save_checkpoint = False
 
 learning_rate = 6e-3  # max learning rate
