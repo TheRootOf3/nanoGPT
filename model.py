@@ -169,30 +169,29 @@ class SplitCausalSelfAttentionVariableNumHeadsIndependent(nn.Module):
         self.head_dim = config.n_embd // config.n_head
         self.dropout = config.dropout
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
+
         self.flash = hasattr(torch.nn.functional, "scaled_dot_product_attention")
-        if not self.flash:
-            print(
-                "WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0"
-            )
-            # causal mask to ensure that attention is only applied to the left in the input sequence
-            self.register_buffer(
-                "bias",
-                torch.tril(torch.ones(config.block_size, config.block_size)).view(
-                    1, 1, config.block_size, config.block_size
-                ),
-            )
+        self.config = config
+
+        # causal mask to ensure that attention is only applied to the left in the input sequence
+        self.register_buffer(
+            "bias",
+            torch.tril(torch.ones(config.block_size, config.block_size)).view(
+                1, 1, config.block_size, config.block_size
+            ),
+        )
 
         # initialise the first half of the heads as trainable, counting from 0
         # self.trainable_heads = list(range(config.n_head // 2))
-        self.trainable_heads = [0, 1]
+        self.trainable_heads = [0]
 
-    def randomize_trainable_heads(self, num_heads: int):
-        """
-        Randomize the trainable heads.
-        Args:
-            num_heads (int): Number of heads to randomize.
-        """
-        self.trainable_heads = torch.randperm(self.n_head).tolist()[:num_heads]
+    # def randomize_trainable_heads(self, num_heads: int):
+    #     """
+    #     Randomize the trainable heads.
+    #     Args:
+    #         num_heads (int): Number of heads to randomize.
+    #     """
+    #     self.trainable_heads = torch.randperm(self.n_head).tolist()[:num_heads]
 
     def set_trainable_heads(self, trainable_heads: list[int]):
         """
@@ -201,6 +200,40 @@ class SplitCausalSelfAttentionVariableNumHeadsIndependent(nn.Module):
             trainable_heads (list[int]): List of head ids to be trainable.
         """
         self.trainable_heads = sorted(trainable_heads)
+
+    def copy_heads(self, copy_from_head_ids: list[int], copy_to_head_ids: list[int]):
+        """
+        Copy weights from one set of heads to another. Copies sequentially, so the first
+        head in `copy_from_head_ids` will be copied to the first head in `copy_to_head_ids`, etc.
+
+        Args:
+            copy_from_head_ids (list[int]): List of head ids to copy from.
+            copy_to_head_ids (list[int]): List of head ids to copy to.
+        """
+        assert len(copy_from_head_ids) == len(
+            copy_to_head_ids
+        ), "Head lists must be of the same length."
+        with torch.no_grad():
+            for from_id, to_id in zip(copy_from_head_ids, copy_to_head_ids):
+                for i in range(3):  # for q, k, v
+                    self.c_attn.weight[
+                        i * self.n_embd
+                        + to_id * self.head_dim : i * self.n_embd
+                        + (to_id + 1) * self.head_dim,
+                        :,
+                    ] = self.c_attn.weight[
+                        i * self.n_embd
+                        + from_id * self.head_dim : i * self.n_embd
+                        + (from_id + 1) * self.head_dim,
+                        :,
+                    ]
+                self.c_proj.weight[
+                    :,
+                    to_id * self.head_dim : (to_id + 1) * self.head_dim,
+                ] = self.c_proj.weight[
+                    :,
+                    from_id * self.head_dim : (from_id + 1) * self.head_dim,
+                ]
 
     def forward(self, x):
         B, T, C = (
@@ -250,7 +283,7 @@ class SplitCausalSelfAttentionVariableNumHeadsIndependent(nn.Module):
         )  # (B, nh, T, hs)
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-        if self.flash:
+        if self.flash and not self.config.output_attentions:
             # efficient attention using Flash Attention CUDA kernels
             y = torch.nn.functional.scaled_dot_product_attention(
                 q,
@@ -285,284 +318,11 @@ class SplitCausalSelfAttentionVariableNumHeadsIndependent(nn.Module):
 
         y = self.resid_dropout(y @ trainable_o.T)
 
-        return y
+        attn_weights = None
+        if self.config.output_attentions:
+            attn_weights = att
 
-
-class SplitCausalSelfAttentionVariableNumHeads(nn.Module):
-
-    def __init__(self, config):
-        super().__init__()
-        assert config.n_embd % config.n_head == 0
-        # key, query, value projections for all heads, but in a batch
-
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
-        # output projection
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
-        # regularization
-        self.attn_dropout = nn.Dropout(config.dropout)
-        self.resid_dropout = nn.Dropout(config.dropout)
-        self.n_head = config.n_head
-        self.n_embd = config.n_embd
-        self.head_dim = config.n_embd // config.n_head
-        self.dropout = config.dropout
-        # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
-        self.flash = hasattr(torch.nn.functional, "scaled_dot_product_attention")
-        if not self.flash:
-            print(
-                "WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0"
-            )
-            # causal mask to ensure that attention is only applied to the left in the input sequence
-            self.register_buffer(
-                "bias",
-                torch.tril(torch.ones(config.block_size, config.block_size)).view(
-                    1, 1, config.block_size, config.block_size
-                ),
-            )
-
-        # initialise the first half of the heads as trainable, counting from 0
-        self.trainable_heads = list(range(config.n_head // 2))
-        # self.trainable_heads = [0, 1]
-
-    def _randomize_heads(self): ...
-
-    def get_non_trainable_heads(self):
-        return sorted(list(set(range(self.n_head)) - set(self.trainable_heads)))
-
-    def forward(self, x):
-        B, T, C = (
-            x.size()
-        )  # batch size, sequence length, embedding dimensionality (n_embd)
-
-        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        # heads = self.c_attn.weight.split(self.n_embd // 3 // self.n_head, dim=0)
-
-        trainable_w = torch.cat(
-            [
-                self.c_attn.weight[
-                    i * self.n_embd
-                    + j * self.head_dim : i * self.n_embd
-                    + (j + 1) * self.head_dim,
-                    :,
-                ]
-                for j in self.trainable_heads
-                for i in range(3)
-            ]
-        )
-
-        non_trainable_w = torch.cat(
-            [
-                self.c_attn.weight[
-                    i * self.n_embd
-                    + j * self.head_dim : i * self.n_embd
-                    + (j + 1) * self.head_dim,
-                    :,
-                ].clone()
-                for j in self.get_non_trainable_heads()
-                for i in range(3)
-            ]
-        ).detach()
-
-        output_t = x @ trainable_w.T
-
-        with torch.no_grad():
-            output_nt = x @ non_trainable_w.T
-
-        # if self.c_attn.bias is not None:
-        #     trainable_b = torch.cat(
-        #         [self.c_attn.bias[i * 768 : i * 768 + 384] for i in range(3)]
-        #     )
-        #     non_trainable_b = torch.cat(
-        #         [
-        #             self.c_attn.bias[i * 768 + 384 : (i + 1) * 768].detach()
-        #             for i in range(3)
-        #         ]
-        #     )
-        #     output_t = output_t + trainable_b
-
-        #     with torch.no_grad():
-        #         output_nt = output_nt + non_trainable_b
-
-        split_t = iter(output_t.split(self.head_dim, dim=2))
-        split_nt = iter(output_nt.split(self.head_dim, dim=2))
-
-        q = []
-        k = []
-        v = []
-        for j in range(self.n_head):
-            if j not in self.get_non_trainable_heads():
-                q.append(next(split_t))
-                k.append(next(split_t))
-                v.append(next(split_t))
-            else:
-                q.append(next(split_nt))
-                k.append(next(split_nt))
-                v.append(next(split_nt))
-
-        q = torch.cat(q, dim=2)
-        k = torch.cat(k, dim=2)
-        v = torch.cat(v, dim=2)
-
-        # q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
-
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(
-            1, 2
-        )  # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(
-            1, 2
-        )  # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(
-            1, 2
-        )  # (B, nh, T, hs)
-
-        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-        if self.flash:
-            # efficient attention using Flash Attention CUDA kernels
-            y = torch.nn.functional.scaled_dot_product_attention(
-                q,
-                k,
-                v,
-                attn_mask=None,
-                dropout_p=self.dropout if self.training else 0,
-                is_causal=True,
-            )
-        else:
-            # manual implementation of attention
-            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
-            att = F.softmax(att, dim=-1)
-            att = self.attn_dropout(att)
-            y = att @ v  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        y = (
-            y.transpose(1, 2).contiguous().view(B, T, C)
-        )  # re-assemble all head outputs side by side -> (B, T, n_embd)
-
-        y = self.resid_dropout(self.c_proj(y))
-
-        return y
-
-
-class SplitCausalSelfAttention(nn.Module):
-
-    def __init__(self, config):
-        super().__init__()
-        assert config.n_embd % config.n_head == 0
-        # key, query, value projections for all heads, but in a batch
-
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
-        # output projection
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
-        # regularization
-        self.attn_dropout = nn.Dropout(config.dropout)
-        self.resid_dropout = nn.Dropout(config.dropout)
-        self.n_head = config.n_head
-        self.n_embd = config.n_embd
-        self.dropout = config.dropout
-        # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
-        self.flash = hasattr(torch.nn.functional, "scaled_dot_product_attention")
-        if not self.flash:
-            print(
-                "WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0"
-            )
-            # causal mask to ensure that attention is only applied to the left in the input sequence
-            self.register_buffer(
-                "bias",
-                torch.tril(torch.ones(config.block_size, config.block_size)).view(
-                    1, 1, config.block_size, config.block_size
-                ),
-            )
-        self.non_trainable_swap: bool = False
-
-    def _swap_non_trainable(self):
-        self.non_trainable_swap = not self.non_trainable_swap
-
-    def forward(self, x):
-        B, T, C = (
-            x.size()
-        )  # batch size, sequence length, embedding dimensionality (n_embd)
-
-        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-
-        trainable_w = torch.cat(
-            [self.c_attn.weight[i * 768 : i * 768 + 384, :] for i in range(3)]
-        )
-        non_trainable_w = torch.cat(
-            [
-                self.c_attn.weight[i * 768 + 384 : (i + 1) * 768, :].clone()
-                for i in range(3)
-            ]
-        ).detach()
-
-        if self.non_trainable_swap:
-            trainable_w, non_trainable_w = non_trainable_w, trainable_w
-
-        output_t = x @ trainable_w.T
-
-        with torch.no_grad():
-            output_nt = x @ non_trainable_w.T
-
-        if self.c_attn.bias is not None:
-            trainable_b = torch.cat(
-                [self.c_attn.bias[i * 768 : i * 768 + 384] for i in range(3)]
-            )
-            non_trainable_b = torch.cat(
-                [
-                    self.c_attn.bias[i * 768 + 384 : (i + 1) * 768].detach()
-                    for i in range(3)
-                ]
-            )
-            if self.non_trainable_swap:
-                trainable_b, non_trainable_b = non_trainable_b, trainable_b
-
-            output_t = output_t + trainable_b
-
-            with torch.no_grad():
-                output_nt = output_nt + non_trainable_b
-
-        # self._swap_non_trainable()
-
-        split_t = output_t.split(self.n_embd // 2, dim=2)
-        split_nt = output_nt.split(self.n_embd // 2, dim=2)
-        q = torch.cat([split_t[0], split_nt[0]], dim=2)
-        k = torch.cat([split_t[1], split_nt[1]], dim=2)
-        v = torch.cat([split_t[2], split_nt[2]], dim=2)
-
-        # q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
-
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(
-            1, 2
-        )  # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(
-            1, 2
-        )  # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(
-            1, 2
-        )  # (B, nh, T, hs)
-
-        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-        if self.flash:
-            # efficient attention using Flash Attention CUDA kernels
-            y = torch.nn.functional.scaled_dot_product_attention(
-                q,
-                k,
-                v,
-                attn_mask=None,
-                dropout_p=self.dropout if self.training else 0,
-                is_causal=True,
-            )
-        else:
-            # manual implementation of attention
-            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
-            att = F.softmax(att, dim=-1)
-            att = self.attn_dropout(att)
-            y = att @ v  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        y = (
-            y.transpose(1, 2).contiguous().view(B, T, C)
-        )  # re-assemble all head outputs side by side
-
-        # output projection
-        y = self.resid_dropout(self.c_proj(y))
-        return y
+        return y, attn_weights
 
 
 class CausalSelfAttention(nn.Module):
@@ -580,24 +340,17 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
-        self.output_attentions = config.output_attentions
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
-        if self.output_attentions:
-            self.flash = False
-        else:
-            self.flash = hasattr(torch.nn.functional, "scaled_dot_product_attention")
+        self.flash = hasattr(torch.nn.functional, "scaled_dot_product_attention")
+        self.config = config
 
-        if not self.flash:
-            print(
-                "WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0"
-            )
-            # causal mask to ensure that attention is only applied to the left in the input sequence
-            self.register_buffer(
-                "bias",
-                torch.tril(torch.ones(config.block_size, config.block_size)).view(
-                    1, 1, config.block_size, config.block_size
-                ),
-            )
+        # causal mask to ensure that attention is only applied to the left in the input sequence
+        self.register_buffer(
+            "bias",
+            torch.tril(torch.ones(config.block_size, config.block_size)).view(
+                1, 1, config.block_size, config.block_size
+            ),
+        )
 
     def forward(self, x):
         B, T, C = (
@@ -617,7 +370,7 @@ class CausalSelfAttention(nn.Module):
         )  # (B, nh, T, hs)
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-        if self.flash:
+        if self.flash and not self.config.output_attentions:
             # efficient attention using Flash Attention CUDA kernels
             y = torch.nn.functional.scaled_dot_product_attention(
                 q,
@@ -642,7 +395,7 @@ class CausalSelfAttention(nn.Module):
         y = self.resid_dropout(self.c_proj(y))
 
         attn_weights = None
-        if self.output_attentions:
+        if self.config.output_attentions:
             attn_weights = att
 
         return y, attn_weights
@@ -761,7 +514,9 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, targets=None, output_attentions=False):
+        prev_output_attentions = self.config.output_attentions
+        self.config.output_attentions = output_attentions
         device = idx.device
         b, t = idx.size()
         assert (
@@ -795,6 +550,8 @@ class GPT(nn.Module):
 
         if self.config.output_attentions:
             return logits, loss, attn_weights_lst
+
+        self.config.output_attentions = prev_output_attentions
 
         return logits, loss
 
