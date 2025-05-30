@@ -168,3 +168,22 @@ def compute_mean_per_head_similarities(
         per_head_similarities[i] = (sim_matrix[i, :].sum() - 1) / (n - 1)
 
     return per_head_similarities
+
+
+def compute_max_per_head_similarities(
+    sim_matrix: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Computes max similarity values for a specific head across all other heads.
+    Parameters:
+        sim_matrix (torch.Tensor): A symmetric matrix of shape (n_heads, n_heads) containing pairwise similarity values.
+    Returns:
+        torch.Tensor: A tensor of shape (n_heads,) containing the similarity values for each head.
+    """
+    n = sim_matrix.shape[0]
+    off_diagonal_sim_matrix = sim_matrix - torch.eye(
+        n, dtype=torch.float32
+    )  # zero out the diagonal
+    per_head_similarities = torch.max(off_diagonal_sim_matrix, dim=1).values
+
+    return per_head_similarities
