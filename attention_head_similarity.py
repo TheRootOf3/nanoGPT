@@ -97,3 +97,74 @@ def aggregate_head_pairwise_metric_batch(
         return metrics
     else:
         return aggregate_fn(torch.tensor(metrics)).item()
+
+
+def compute_pairwise_symmetric_similarity_matrix(
+    attn_weights: torch.Tensor,
+    metric_fn: callable,
+) -> torch.Tensor:
+    """
+    Computes a pairwise similarity matrix for all head pairs in the attention weights.
+    It assumes that the metric function is symmetric, meaning that the order of inputs does not matter.
+    NOTE: The diagonal of the matrix is filled with ones, representing self-similarity.
+
+    Parameters:
+        attn_weights (torch.Tensor): Attention weights of shape (batch_size, n_heads, seq_len, seq_len).
+        metric_fn (callable): Function to compute the pairwise metric. It must be symmetric.
+    Returns:
+        torch.Tensor: A symmetric matrix of shape (n_heads, n_heads) containing the pairwise metric values.
+    """
+    n_heads = attn_weights.shape[1]
+    similarity_matrix = torch.zeros((n_heads, n_heads), dtype=torch.float32)
+
+    for i in range(n_heads):
+        for j in range(i + 1, n_heads):
+            metric_value = metric_fn(attn_weights[:, i], attn_weights[:, j])
+            similarity_matrix[i, j] = metric_value
+            similarity_matrix[j, i] = metric_value  # Symmetric matrix
+
+    # Fill the diagonal with ones (self-similarity)
+    for i in range(n_heads):
+        similarity_matrix[i, i] = 1.0
+
+    return similarity_matrix
+
+
+def compute_aggr_pairwise_similarity(
+    sim_matrix: torch.Tensor,
+    aggregate_fn: callable,
+) -> float:
+    """
+    Computes the aggregated pairwise similarity from a symmetric matrix of shape (n_heads, n_heads).
+
+    Parameters:
+        sim_matrix (torch.Tensor): A symmetric matrix of shape (n_heads, n_heads) containing pairwise similarity values.
+        aggregate_fn (callable, optional): Function to aggregate the results across head pairs. If not provided, the mean of the upper triangular part is returned.
+
+    Returns:
+        float: The aggregated similarity value.
+    """
+    n = sim_matrix.shape[0]
+    upper_tri_indices = torch.triu_indices(n, n, offset=1)
+    upper_tri_values = sim_matrix[upper_tri_indices[0], upper_tri_indices[1]]
+
+    return aggregate_fn(upper_tri_values).item()
+
+
+def compute_mean_per_head_similarities(
+    sim_matrix: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Computes mean similarity values for a specific head across all other heads.
+    Parameters:
+        sim_matrix (torch.Tensor): A symmetric matrix of shape (n_heads, n_heads) containing pairwise similarity values.
+    Returns:
+        torch.Tensor: A tensor of shape (n_heads,) containing the similarity values for each head.
+    """
+    n = sim_matrix.shape[0]
+    per_head_similarities = torch.zeros(n, dtype=torch.float32)
+    for i in range(n):
+        # subtract 1 to remove self-similarity, then divide by (n-1) to normalize
+        per_head_similarities[i] = (sim_matrix[i, :].sum() - 1) / (n - 1)
+
+    return per_head_similarities
