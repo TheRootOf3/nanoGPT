@@ -5,9 +5,9 @@
 
 wandb_log = True
 wandb_project = "owt"
-wandb_run_name = "gpt2-124M"
+wandb_run_name = "gpt2-16M-causal"
 
-out_dir = "out-split-gpt2-16m"
+out_dir = "out-16M-split"
 
 # model - 16M GPT-2
 block_size = 512
@@ -38,6 +38,7 @@ compile = False
 # attention_layer = "causal"
 attention_layer = "selective"
 
-always_save_checkpoint = False
+save_checkpoint = True
+override_checkpoint = False
 
 learning_rate = 6e-3  # max learning rate

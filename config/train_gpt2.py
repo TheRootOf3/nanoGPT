@@ -5,7 +5,9 @@
 
 wandb_log = True
 wandb_project = "owt"
-wandb_run_name = "gpt2-124M"
+wandb_run_name = "gpt2-124M-causal"
+
+out_dir = "out-124M-causal"
 
 
 batch_size = 16
@@ -32,4 +34,5 @@ attention_layer = "causal"
 # attention_layer = "selective"
 
 learning_rate = 6e-4  # max learning rate
-always_save_checkpoint = False
+save_checkpoint = True
+override_checkpoint = False

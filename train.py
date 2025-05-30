@@ -34,10 +34,13 @@ from model import (
     SplitCausalSelfAttentionVariableNumHeadsIndependent,
 )
 from attention_head_similarity import (
-    aggregate_head_pairwise_metric_batch,
     cosine_similarity,
     cka,
+    compute_pairwise_symmetric_similarity_matrix,
+    compute_aggr_pairwise_similarity,
+    compute_mean_per_head_similarities,
 )
+from matplotlib import pyplot as plt
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -47,7 +50,7 @@ eval_interval = 2000
 log_interval = 1
 eval_iters = 200
 eval_only = False  # if True, script exits right after the first eval
-always_save_checkpoint = True  # if True, always save a checkpoint after each eval
+save_checkpoint = True  # if True, always save a checkpoint after each eval
 init_from = "scratch"  # 'scratch' or 'resume' or 'gpt2*'
 # wandb logging
 wandb_log = False  # disabled by default
@@ -90,6 +93,7 @@ dtype = (
 compile = True  # use PyTorch 2.0 to compile the model to be faster
 attention_layer = "causal"  # 'selective'
 output_attentions = False  # whether to output attention weights for each block
+override_checkpoint = True
 
 # -----------------------------------------------------------------------------
 config_keys = [
@@ -305,24 +309,55 @@ def estimate_loss():
 
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
-def estimate_attention_head_similarity():
+def estimate_attention_head_similarity(X_sim, Y_sim):
     out = {}
     model.eval()
-    # compute CKA for each block
     n_blocks = gptconf.n_layer  # number of blocks in the model
-    cka_results = [[] for _ in range(n_blocks)]
-    for k in range(3):
-        X, Y = get_batch("val")
-        with ctx:
-            _, _, attn_weights = model(X, Y, output_attentions=True)
-        for block_idx in range(n_blocks):
-            cka_results[block_idx].extend(
-                aggregate_head_pairwise_metric_batch(
-                    attn_weights[block_idx],
-                    cka,
-                )
-            )
-    out["cka_per_block"] = np.mean(cka_results, axis=1)
+    cka_results = []
+    cossim_results = []
+    head_idx = []
+    # we will use the cosine similarity metric for the CKA
+    with ctx:
+        _, _, attn_weights = model(X_sim, Y_sim, output_attentions=True)
+    if attn_weights[0].shape[1] == 1:
+        return None
+    for block_idx in range(n_blocks):
+        S_cka = compute_pairwise_symmetric_similarity_matrix(
+            attn_weights[block_idx], cka
+        )
+        S_cossim = compute_pairwise_symmetric_similarity_matrix(
+            attn_weights[block_idx], cosine_similarity
+        )
+        cka_results.append(S_cka)
+        cossim_results.append(S_cossim)
+
+        local_model = model if not ddp else model.module
+        if isinstance(
+            local_model.transformer.h[block_idx].attn,
+            SplitCausalSelfAttentionVariableNumHeadsIndependent,
+        ):
+            head_idx.append(local_model.transformer.h[block_idx].attn.trainable_heads)
+
+    out["cka_per_block"] = [
+        compute_aggr_pairwise_similarity(S, torch.mean) for S in cka_results
+    ]
+    out["cossim_per_block"] = [
+        compute_aggr_pairwise_similarity(S, torch.mean) for S in cossim_results
+    ]
+    out["cka_max_per_block"] = [
+        compute_aggr_pairwise_similarity(S, torch.max) for S in cka_results
+    ]
+    out["cossim_max_per_block"] = [
+        compute_aggr_pairwise_similarity(S, torch.max) for S in cka_results
+    ]
+    out["cka_std_per_block"] = [
+        compute_aggr_pairwise_similarity(S, torch.std) for S in cka_results
+    ]
+    out["cossim_std_per_block"] = [
+        compute_aggr_pairwise_similarity(S, torch.std) for S in cossim_results
+    ]
+    out["cka"] = cka_results
+    out["cossim"] = cossim_results
     model.train()
     return out
 
@@ -342,6 +377,98 @@ def get_lr(it):
     return min_lr + coeff * (learning_rate - min_lr)
 
 
+def log_similarity_heatmap(S: torch.Tensor, step: int, name: str):
+    fig, ax = plt.subplots(figsize=(6, 6), dpi=300)
+    im = ax.imshow(S, vmin=0, vmax=1, cmap="viridis")
+    ax.set_title(f"Head-Head Similarity\n{name}, step: {step}")
+    ax.set_xlabel("Head index")
+    ax.set_ylabel("Head index")
+
+    # Add ticks between 0 and S.shape[0], centered
+    tick_positions = np.arange(S.shape[0])
+    ax.set_xticks(tick_positions)
+    ax.set_yticks(tick_positions)
+    ax.set_xticklabels(tick_positions)
+    ax.set_yticklabels(tick_positions)
+    ax.tick_params(axis="both", which="major", labelsize=8)
+
+    # Add value annotations
+    for i in range(S.shape[0]):
+        for j in range(S.shape[1]):
+            value = S[i, j].item()
+            ax.text(
+                j,
+                i,
+                f"{value:.2f}",
+                ha="center",
+                va="center",
+                fontsize=6,
+                color="white" if value < 0.5 else "black",
+            )
+
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    # Log the figure
+    wandb.log({name: wandb.Image(fig)}, step=step)
+    plt.close(fig)
+
+
+def log_per_head_model_heatmap(
+    per_layer_head_similarities: list[torch.Tensor], step: int
+):
+
+    S = torch.vstack(per_layer_head_similarities[::-1])
+
+    fig, ax = plt.subplots(figsize=(10, 8), dpi=300)
+    im = ax.imshow(S, vmin=0, vmax=1, cmap="viridis")
+    ax.set_title(f"Per-Head Model CKA Similarity Heatmap, step: {step}")
+    ax.set_xlabel("Head index")
+    ax.set_ylabel("Layer index")
+
+    # Set y-ticks to reflect the correct layer indices (reversed)
+    num_layers = S.shape[0]
+    ax.set_yticks(range(num_layers))
+    ax.set_yticklabels(range(num_layers - 1, -1, -1))  # Reversed layer indices
+
+    # Set x-ticks to reflect the correct head indices
+    num_heads = S.shape[1]
+    ax.set_xticks(range(num_heads))
+    ax.set_xticklabels(range(num_heads))
+    ax.tick_params(axis="both", which="major", labelsize=12)
+    # Add value annotations
+    for i in range(S.shape[0]):  # iterate over layers
+        for j in range(S.shape[1]):
+            value = S[i, j].item()
+            ax.text(
+                j,
+                i,
+                f"{value:.2f}",
+                ha="center",
+                va="center",
+                fontsize=10,
+                color="white" if value < 0.5 else "black",
+            )
+
+    # Add colorbar
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+    # Log the figure
+    wandb.log({"cka_per_head/model_head_heatmap": wandb.Image(fig)}, step=step)
+    plt.close(fig)
+
+
+def get_head_max_similarity_threshold(iter_num: int) -> float:
+    # cosine schedule for head max simiality threshold
+
+    # Max similarity threshold means that we will not add any new heads until there exists pair of heads
+    # with similarity value lower than the threshold. This promotes the model to learn different heads and
+    # gradually allows for more similarity as the training progresses.
+
+    t_0 = 0.3  # initial threshold
+    t_1 = 0.9  # final threshold
+    t = iter_num / max_iters
+    return t_0 + (t_1 - t_0) * (1 - math.cos(math.pi * t)) / 2
+
+
 # logging
 if wandb_log and master_process:
     import wandb
@@ -349,12 +476,26 @@ if wandb_log and master_process:
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
     wandb.watch(model, log_freq=log_interval)
 
+X_sim, Y_sim = get_batch("val")  # fetch the very first batch for similarity
+
 # training loop
 X, Y = get_batch("train")  # fetch the very first batch
 local_iter_num = 0  # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model  # unwrap DDP container if needed
 running_mfu = -1.0
 while True:
+
+    local_model = model.module if ddp else model  # unwrap DDP container if needed
+
+    # if iter_num == 1000:
+    #     for block in local_model.transformer.h:
+    #         block.attn.copy_heads([0], [1])
+    #         block.attn.set_trainable_heads([0, 1])
+
+    # if iter_num == 2000:
+    #     for block in local_model.transformer.h:
+    #         block.attn.copy_heads([0, 1], [2, 3])
+    #         block.attn.set_trainable_heads([0, 1, 2, 3])
 
     # determine and set the learning rate for this iteration
     lr = get_lr(iter_num) if decay_lr else learning_rate
@@ -364,38 +505,90 @@ while True:
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
-        attn = estimate_attention_head_similarity()
+        attn = estimate_attention_head_similarity(X_sim, Y_sim)
         print(
             f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}"
         )
         if wandb_log:
             log_data = {
-                "iter": iter_num,
                 "train/loss_est": losses["train"],
                 "val/loss_est": losses["val"],
-                "lr": lr,
-                "mfu": running_mfu * 100,  # convert to percentage
             }
-            log_data.update(
-                {
-                    f"val/cka_block_{i}": attn["cka_per_block"][i]
-                    for i in range(len(attn["cka_per_block"]))
-                }
-            )
-            wandb.log(log_data)
+            if attn is not None:
+                log_data.update(
+                    {
+                        f"cka/block_{i}": attn["cka_per_block"][i]
+                        for i in range(len(attn["cka_per_block"]))
+                    }
+                )
+                log_data.update(
+                    {
+                        f"cossim/block_{i}": attn["cossim_per_block"][i]
+                        for i in range(len(attn["cossim_per_block"]))
+                    }
+                )
+                log_data.update(
+                    {
+                        f"cka/std_block_{i}": attn["cka_std_per_block"][i]
+                        for i in range(len(attn["cka_std_per_block"]))
+                    }
+                )
+                log_data.update(
+                    {
+                        f"cossim/std_block_{i}": attn["cossim_std_per_block"][i]
+                        for i in range(len(attn["cossim_std_per_block"]))
+                    }
+                )
+                log_data.update(
+                    {
+                        f"cka/max_block_{i}": attn["cka_max_per_block"][i]
+                        for i in range(len(attn["cka_max_per_block"]))
+                    }
+                )
+                log_data.update(
+                    {
+                        f"cossim/max_block_{i}": attn["cossim_max_per_block"][i]
+                        for i in range(len(attn["cossim_max_per_block"]))
+                    }
+                )
 
-        if always_save_checkpoint:
+                for block_id in range(len(attn["cka"])):
+                    log_similarity_heatmap(
+                        attn["cka"][block_id],
+                        step=iter_num,
+                        name=f"cka_heatmap/block_{block_id}",
+                    )
+                    log_similarity_heatmap(
+                        attn["cossim"][block_id],
+                        step=iter_num,
+                        name=f"cossim_heatmap/block_{block_id}",
+                    )
+
+                mean_per_head_sims = [
+                    compute_mean_per_head_similarities(attn["cka"][i])
+                    for i in range(len(attn["cka"]))
+                ]
+
+                log_per_head_model_heatmap(
+                    mean_per_head_sims,
+                    step=iter_num,
+                )
+
+            wandb.log(log_data, step=iter_num)
+
+        if save_checkpoint:
             best_val_loss = losses["val"]
             checkpoint = {
                 "model": raw_model.state_dict(),
-                "optimizer": optimizer.state_dict(),
+                # "optimizer": optimizer.state_dict(),
                 "model_args": model_args,
                 "iter_num": iter_num,
                 "best_val_loss": best_val_loss,
                 "config": config,
             }
             print(f"saving checkpoint to {out_dir}")
-            torch.save(checkpoint, os.path.join(out_dir, f"ckpt_{iter_num}.pt"))
+            name = "ckpt.pt" if override_checkpoint else f"ckpt_{iter_num}.pt"
+            torch.save(checkpoint, os.path.join(out_dir, name))
     if iter_num == 0 and eval_only:
         break
 
@@ -407,16 +600,6 @@ while True:
     # if iter_num % 1999 == 0:
     #     for block in model.transformer.h:
     #         block.attn.randomize_trainable_heads(4)
-
-    if iter_num == 1000:
-        for block in model.transformer.h:
-            block.attn.copy_heads([0], [1])
-            block.attn.set_trainable_heads([0, 1])
-
-    if iter_num == 2000:
-        for block in model.transformer.h:
-            block.attn.copy_heads([0, 1], [2, 3])
-            block.attn.set_trainable_heads([0, 1, 2, 3])
 
     # forward backward update, with optional gradient accumulation to simulate larger batch size
     # and using the GradScaler if data type is float16
@@ -469,7 +652,11 @@ while True:
                     "iter_time": dt * 1000,
                     "lr": lr,
                     "mfu": running_mfu * 100,  # convert to percentage
-                }
+                    "head_max_similarity_threshold": get_head_max_similarity_threshold(
+                        iter_num
+                    ),
+                },
+                step=iter_num,
             )
     iter_num += 1
     local_iter_num += 1

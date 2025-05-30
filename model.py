@@ -183,7 +183,7 @@ class SplitCausalSelfAttentionVariableNumHeadsIndependent(nn.Module):
 
         # initialise the first half of the heads as trainable, counting from 0
         # self.trainable_heads = list(range(config.n_head // 2))
-        self.trainable_heads = [0]
+        self.trainable_heads = [0, 1]
 
     # def randomize_trainable_heads(self, num_heads: int):
     #     """
