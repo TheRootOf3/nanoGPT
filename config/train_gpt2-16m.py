@@ -5,14 +5,14 @@
 
 wandb_log = True
 wandb_project = "owt"
-wandb_run_name = "gpt2-16M-causal"
+wandb_run_name = "gpt2-16M-split-scheduled-copy"
 
 out_dir = "out-16M-split"
 
 # model - 16M GPT-2
 block_size = 512
 n_layer = 4
-n_head = 4
+n_head = 8
 n_embd = 256
 dropout = 0.0  # for pretraining 0 is good, for finetuning try 0.1+
 bias = False  # do we use bias inside LayerNorm and Linear layers?
@@ -38,7 +38,8 @@ compile = False
 # attention_layer = "causal"
 attention_layer = "selective"
 
-save_checkpoint = True
+save_checkpoint = False
 override_checkpoint = False
 
 learning_rate = 6e-3  # max learning rate
+warmup_iters = 200

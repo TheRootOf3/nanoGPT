@@ -39,6 +39,7 @@ from attention_head_similarity import (
     compute_pairwise_symmetric_similarity_matrix,
     compute_aggr_pairwise_similarity,
     compute_mean_per_head_similarities,
+    compute_max_per_head_similarities,
 )
 from matplotlib import pyplot as plt
 
@@ -413,8 +414,21 @@ def log_similarity_heatmap(S: torch.Tensor, step: int, name: str):
 
 
 def log_per_head_model_heatmap(
-    per_layer_head_similarities: list[torch.Tensor], step: int
+    per_layer_head_similarities: list[torch.Tensor],
+    step: int,
+    name: str,
 ):
+    max_n_heads = max([len(s) for s in per_layer_head_similarities])
+    # Ensure all tensors have the same number of heads by right padding with zeros
+    per_layer_head_similarities = [
+        torch.cat(
+            [
+                s,
+                torch.zeros(max_n_heads - len(s)),
+            ]
+        )
+        for s in per_layer_head_similarities
+    ]
 
     S = torch.vstack(per_layer_head_similarities[::-1])
 
@@ -452,7 +466,7 @@ def log_per_head_model_heatmap(
     fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
     # Log the figure
-    wandb.log({"cka_per_head/model_head_heatmap": wandb.Image(fig)}, step=step)
+    wandb.log({name: wandb.Image(fig)}, step=step)
     plt.close(fig)
 
 
@@ -463,7 +477,7 @@ def get_head_max_similarity_threshold(iter_num: int) -> float:
     # with similarity value lower than the threshold. This promotes the model to learn different heads and
     # gradually allows for more similarity as the training progresses.
 
-    t_0 = 0.3  # initial threshold
+    t_0 = 0.4  # initial threshold
     t_1 = 0.9  # final threshold
     t = iter_num / max_iters
     return t_0 + (t_1 - t_0) * (1 - math.cos(math.pi * t)) / 2
@@ -483,19 +497,43 @@ X, Y = get_batch("train")  # fetch the very first batch
 local_iter_num = 0  # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model  # unwrap DDP container if needed
 running_mfu = -1.0
+add_new_heads = [False for _ in range(gptconf.n_layer)]
+last_time_heads_added = [
+    0 for _ in range(gptconf.n_layer)
+]  # when was the last time we added new heads
+last_time_heads_added_fraction = 0.1
+copy_heads = (
+    True  # whether to copy the heads from the previous layer when adding new heads
+)
 while True:
 
     local_model = model.module if ddp else model  # unwrap DDP container if needed
+    if attention_layer == "selective":
+        for i, layer in enumerate(local_model.transformer.h):
+            # check if we need to add new heads in this layer
+            if (
+                add_new_heads[i]
+                and (iter_num - last_time_heads_added[i]) / max_iters
+                > last_time_heads_added_fraction
+            ):
+                if len(layer.attn.trainable_heads) <= gptconf.n_head // 2:
+                    # add new heads to the model
+                    print(
+                        f"step {iter_num}: adding new heads to layer {i}, "
+                        f"last time added was {last_time_heads_added[i]}"
+                    )
+                    # double the number of trainable heads
+                    current_n_heads = len(layer.attn.trainable_heads)
+                    if copy_heads:
+                        layer.attn.copy_heads(
+                            layer.attn.trainable_heads,
+                            list(range(current_n_heads, 2 * current_n_heads)),
+                        )
 
-    # if iter_num == 1000:
-    #     for block in local_model.transformer.h:
-    #         block.attn.copy_heads([0], [1])
-    #         block.attn.set_trainable_heads([0, 1])
-
-    # if iter_num == 2000:
-    #     for block in local_model.transformer.h:
-    #         block.attn.copy_heads([0, 1], [2, 3])
-    #         block.attn.set_trainable_heads([0, 1, 2, 3])
+                    layer.attn.set_trainable_heads(list(range(2 * current_n_heads)))
+                    last_time_heads_added[i] = iter_num
+                # turn off the flag to add new heads even when not added but can't add anymore
+                add_new_heads[i] = False
 
     # determine and set the learning rate for this iteration
     lr = get_lr(iter_num) if decay_lr else learning_rate
@@ -564,14 +602,25 @@ while True:
                         name=f"cossim_heatmap/block_{block_id}",
                     )
 
+                    head_sim_th = get_head_max_similarity_threshold(iter_num)
+                    if attn["cka_max_per_block"][block_id] < head_sim_th:
+                        add_new_heads[block_id] = True
+
                 mean_per_head_sims = [
                     compute_mean_per_head_similarities(attn["cka"][i])
                     for i in range(len(attn["cka"]))
                 ]
 
+                max_per_head_sims = [
+                    compute_max_per_head_similarities(attn["cka"][i])
+                    for i in range(len(attn["cka"]))
+                ]
+
                 log_per_head_model_heatmap(
-                    mean_per_head_sims,
-                    step=iter_num,
+                    mean_per_head_sims, iter_num, "cka_per_head/mean_model_head_heatmap"
+                )
+                log_per_head_model_heatmap(
+                    max_per_head_sims, iter_num, "cka_per_head/max_model_head_heatmap"
                 )
 
             wandb.log(log_data, step=iter_num)
@@ -596,10 +645,6 @@ while True:
     # Add the attention head splitting
     # The idea is that we only backprop through and train only one half of the attention heads
     # and in the next iteration we train the other half
-
-    # if iter_num % 1999 == 0:
-    #     for block in model.transformer.h:
-    #         block.attn.randomize_trainable_heads(4)
 
     # forward backward update, with optional gradient accumulation to simulate larger batch size
     # and using the GradScaler if data type is float16
