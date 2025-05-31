@@ -215,7 +215,7 @@ class SplitCausalSelfAttentionVariableNumHeadsIndependent(nn.Module):
         ), "Head lists must be of the same length."
         with torch.no_grad():
             for from_id, to_id in zip(copy_from_head_ids, copy_to_head_ids):
-                for i in range(3):  # for q, k, v
+                for i in range(3):  # for k, q, v
                     self.c_attn.weight[
                         i * self.n_embd
                         + to_id * self.head_dim : i * self.n_embd
@@ -258,19 +258,10 @@ class SplitCausalSelfAttentionVariableNumHeadsIndependent(nn.Module):
 
         output_t = x @ trainable_w.T
 
-        split_t = iter(output_t.split(self.head_dim, dim=2))
-
-        q = []
-        k = []
-        v = []
-        for _ in sorted(self.trainable_heads):
-            q.append(next(split_t))
-            k.append(next(split_t))
-            v.append(next(split_t))
-
-        q = torch.cat(q, dim=2)
-        k = torch.cat(k, dim=2)
-        v = torch.cat(v, dim=2)
+        k, q, v = output_t.split(
+            len(self.trainable_heads) * self.head_dim,
+            dim=2,
+        )
 
         k = k.view(B, T, len(self.trainable_heads), self.head_dim).transpose(
             1, 2
