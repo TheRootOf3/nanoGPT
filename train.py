@@ -1,21 +1,3 @@
-"""
-This training script can be run both on a single gpu in debug mode,
-and also in a larger training run with distributed data parallel (ddp).
-
-To run on a single GPU, example:
-$ python train.py --batch_size=32 --compile=False
-
-To run with DDP on 4 gpus on 1 node, example:
-$ torchrun --standalone --nproc_per_node=4 train.py
-
-To run with DDP on 4 gpus across 2 nodes, example:
-- Run on the first (master) node with example IP 123.456.123.456:
-$ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=0 --master_addr=123.456.123.456 --master_port=1234 train.py
-- Run on the worker node:
-$ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=123.456.123.456 --master_port=1234 train.py
-(If your cluster does not have Infiniband interconnect prepend NCCL_IB_DISABLE=1)
-"""
-
 import os
 import time
 import math
@@ -26,6 +8,7 @@ import numpy as np
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
+from matplotlib import pyplot as plt
 
 from model import (
     GPTConfig,
@@ -33,15 +16,33 @@ from model import (
     CausalSelfAttention,
     SplitCausalSelfAttentionVariableNumHeadsIndependent,
 )
+
+from plotting.similarity_heatmaps import (
+    get_per_head_model_heatmap,
+    get_similarity_heatmap,
+)
+
+from schedulers import head_max_similarity_schedule, wsd_schedule
+
 from attention_head_similarity import (
     cosine_similarity,
     cka,
     compute_pairwise_symmetric_similarity_matrix,
     compute_aggr_pairwise_similarity,
-    compute_mean_per_head_similarities,
-    compute_max_per_head_similarities,
+    compute_mean_per_head_redundancy,
+    compute_max_per_head_redundancy,
+    biased_hsic,
 )
-from matplotlib import pyplot as plt
+
+plt.rcParams.update(
+    {
+        "text.usetex": True,
+        "font.family": "serif",
+        "font.serif": ["Computer Modern Roman"],
+        # "font.sans-serif": "Helvetica",
+    }
+)
+
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -62,7 +63,7 @@ dataset = "openwebtext"
 gradient_accumulation_steps = 5 * 8  # used to simulate larger batch sizes
 batch_size = 12  # if gradient_accumulation_steps > 1, this is the micro-batch size
 # model - 124M GPT-2
-block_size = 1024
+d_model = 1024
 n_layer = 12
 n_head = 12
 n_embd = 768
@@ -93,8 +94,9 @@ dtype = (
 )  # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = True  # use PyTorch 2.0 to compile the model to be faster
 attention_layer = "causal"  # 'selective'
-output_attentions = False  # whether to output attention weights for each block
+output_attentions = False  # whether to output attention weights for each layer
 override_checkpoint = True
+modify_number_of_heads = False
 
 # -----------------------------------------------------------------------------
 config_keys = [
@@ -140,13 +142,13 @@ else:
     master_process = True
     seed_offset = 0
     ddp_world_size = 1
-tokens_per_iter = gradient_accumulation_steps * ddp_world_size * batch_size * block_size
+tokens_per_iter = gradient_accumulation_steps * ddp_world_size * batch_size * d_model
 print(f"tokens per iteration will be: {tokens_per_iter:,}")
 print(f"max num of iterations will be: {int(max_iters)}")
 print(f"num of warmup iterations will be: {int(warmup_iters)}")
 
 if master_process:
-    os.makedirs(out_dir, exist_ok=True)
+    os.makedirs(os.path.join(out_dir, "plots"), exist_ok=True)
 torch.manual_seed(1337 + seed_offset)
 torch.backends.cuda.matmul.allow_tf32 = True  # allow tf32 on matmul
 torch.backends.cudnn.allow_tf32 = True  # allow tf32 on cudnn
@@ -174,15 +176,12 @@ def get_batch(split):
         data = np.memmap(os.path.join(data_dir, "train.bin"), dtype=np.uint16, mode="r")
     else:
         data = np.memmap(os.path.join(data_dir, "val.bin"), dtype=np.uint16, mode="r")
-    ix = torch.randint(len(data) - block_size, (batch_size,))
+    ix = torch.randint(len(data) - d_model, (batch_size,))
     x = torch.stack(
-        [torch.from_numpy((data[i : i + block_size]).astype(np.int64)) for i in ix]
+        [torch.from_numpy((data[i : i + d_model]).astype(np.int64)) for i in ix]
     )
     y = torch.stack(
-        [
-            torch.from_numpy((data[i + 1 : i + 1 + block_size]).astype(np.int64))
-            for i in ix
-        ]
+        [torch.from_numpy((data[i + 1 : i + 1 + d_model]).astype(np.int64)) for i in ix]
     )
     if device_type == "cuda":
         # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
@@ -212,7 +211,7 @@ model_args = dict(
     n_layer=n_layer,
     n_head=n_head,
     n_embd=n_embd,
-    block_size=block_size,
+    block_size=d_model,
     bias=bias,
     vocab_size=None,
     dropout=dropout,
@@ -262,10 +261,10 @@ elif init_from.startswith("gpt2"):
     for k in ["n_layer", "n_head", "n_embd", "block_size", "bias", "vocab_size"]:
         model_args[k] = getattr(model.config, k)
 # crop down the model block size if desired, using model surgery
-if block_size < model.config.block_size:
-    model.crop_block_size(block_size)
+if d_model < model.config.block_size:
+    model.crop_block_size(d_model)
     model_args["block_size"] = (
-        block_size  # so that the checkpoint will have the right value
+        d_model  # so that the checkpoint will have the right value
     )
 model.to(device)
 
@@ -313,7 +312,7 @@ def estimate_loss():
 def estimate_attention_head_similarity(X_sim, Y_sim):
     out = {}
     model.eval()
-    n_blocks = gptconf.n_layer  # number of blocks in the model
+    n_layer = gptconf.n_layer  # number of layers in the model
     cka_results = []
     cossim_results = []
     head_idx = []
@@ -322,165 +321,45 @@ def estimate_attention_head_similarity(X_sim, Y_sim):
         _, _, attn_weights = model(X_sim, Y_sim, output_attentions=True)
     if attn_weights[0].shape[1] == 1:
         return None
-    for block_idx in range(n_blocks):
+    for layer_idx in range(n_layer):
         S_cka = compute_pairwise_symmetric_similarity_matrix(
-            attn_weights[block_idx], cka
+            attn_weights[layer_idx], cka
         )
         S_cossim = compute_pairwise_symmetric_similarity_matrix(
-            attn_weights[block_idx], cosine_similarity
+            attn_weights[layer_idx], cosine_similarity
         )
         cka_results.append(S_cka)
         cossim_results.append(S_cossim)
 
         local_model = model if not ddp else model.module
         if isinstance(
-            local_model.transformer.h[block_idx].attn,
+            local_model.transformer.h[layer_idx].attn,
             SplitCausalSelfAttentionVariableNumHeadsIndependent,
         ):
-            head_idx.append(local_model.transformer.h[block_idx].attn.trainable_heads)
+            head_idx.append(local_model.transformer.h[layer_idx].attn.trainable_heads)
 
-    out["cka_per_block"] = [
+    out["cka_mean_redundancy_per_layer"] = [
         compute_aggr_pairwise_similarity(S, torch.mean) for S in cka_results
     ]
-    out["cossim_per_block"] = [
+    out["cossim_mean_redundancy_per_layer"] = [
         compute_aggr_pairwise_similarity(S, torch.mean) for S in cossim_results
     ]
-    out["cka_max_per_block"] = [
+    out["cka_max_redundancy_per_layer"] = [
         compute_aggr_pairwise_similarity(S, torch.max) for S in cka_results
     ]
-    out["cossim_max_per_block"] = [
+    out["cossim_max_redundancy_per_layer"] = [
         compute_aggr_pairwise_similarity(S, torch.max) for S in cka_results
     ]
-    out["cka_std_per_block"] = [
+    out["cka_std_redundancy_per_layer"] = [
         compute_aggr_pairwise_similarity(S, torch.std) for S in cka_results
     ]
-    out["cossim_std_per_block"] = [
+    out["cossim_std_redundancy_per_layer"] = [
         compute_aggr_pairwise_similarity(S, torch.std) for S in cossim_results
     ]
     out["cka"] = cka_results
     out["cossim"] = cossim_results
     model.train()
     return out
-
-
-# learning rate decay scheduler (cosine with warmup)
-def get_lr(it):
-    # 1) linear warmup for warmup_iters steps
-    if it < warmup_iters:
-        return learning_rate * (it + 1) / (warmup_iters + 1)
-    # 2) if it > lr_decay_iters, return min learning rate
-    if it > lr_decay_iters:
-        return min_lr
-    # 3) in between, use cosine decay down to min learning rate
-    decay_ratio = (it - warmup_iters) / (lr_decay_iters - warmup_iters)
-    assert 0 <= decay_ratio <= 1
-    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))  # coeff ranges 0..1
-    return min_lr + coeff * (learning_rate - min_lr)
-
-
-def log_similarity_heatmap(S: torch.Tensor, step: int, name: str):
-    fig, ax = plt.subplots(figsize=(6, 6), dpi=300)
-    im = ax.imshow(S, vmin=0, vmax=1, cmap="viridis")
-    ax.set_title(f"Head-Head Similarity\n{name}, step: {step}")
-    ax.set_xlabel("Head index")
-    ax.set_ylabel("Head index")
-
-    # Add ticks between 0 and S.shape[0], centered
-    tick_positions = np.arange(S.shape[0])
-    ax.set_xticks(tick_positions)
-    ax.set_yticks(tick_positions)
-    ax.set_xticklabels(tick_positions)
-    ax.set_yticklabels(tick_positions)
-    ax.tick_params(axis="both", which="major", labelsize=8)
-
-    # Add value annotations
-    for i in range(S.shape[0]):
-        for j in range(S.shape[1]):
-            value = S[i, j].item()
-            ax.text(
-                j,
-                i,
-                f"{value:.2f}",
-                ha="center",
-                va="center",
-                fontsize=6,
-                color="white" if value < 0.5 else "black",
-            )
-
-    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    # Log the figure
-    wandb.log({name: wandb.Image(fig)}, step=step)
-    plt.close(fig)
-
-
-def log_per_head_model_heatmap(
-    per_layer_head_similarities: list[torch.Tensor],
-    step: int,
-    name: str,
-):
-    max_n_heads = max([len(s) for s in per_layer_head_similarities])
-    # Ensure all tensors have the same number of heads by right padding with zeros
-    per_layer_head_similarities = [
-        torch.cat(
-            [
-                s,
-                torch.zeros(max_n_heads - len(s)),
-            ]
-        )
-        for s in per_layer_head_similarities
-    ]
-
-    S = torch.vstack(per_layer_head_similarities[::-1])
-
-    fig, ax = plt.subplots(figsize=(10, 8), dpi=300)
-    im = ax.imshow(S, vmin=0, vmax=1, cmap="viridis")
-    ax.set_title(f"Per-Head Model CKA Similarity Heatmap, step: {step}")
-    ax.set_xlabel("Head index")
-    ax.set_ylabel("Layer index")
-
-    # Set y-ticks to reflect the correct layer indices (reversed)
-    num_layers = S.shape[0]
-    ax.set_yticks(range(num_layers))
-    ax.set_yticklabels(range(num_layers - 1, -1, -1))  # Reversed layer indices
-
-    # Set x-ticks to reflect the correct head indices
-    num_heads = S.shape[1]
-    ax.set_xticks(range(num_heads))
-    ax.set_xticklabels(range(num_heads))
-    ax.tick_params(axis="both", which="major", labelsize=12)
-    # Add value annotations
-    for i in range(S.shape[0]):  # iterate over layers
-        for j in range(S.shape[1]):
-            value = S[i, j].item()
-            ax.text(
-                j,
-                i,
-                f"{value:.2f}",
-                ha="center",
-                va="center",
-                fontsize=10,
-                color="white" if value < 0.5 else "black",
-            )
-
-    # Add colorbar
-    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-
-    # Log the figure
-    wandb.log({name: wandb.Image(fig)}, step=step)
-    plt.close(fig)
-
-
-def get_head_max_similarity_threshold(iter_num: int) -> float:
-    # cosine schedule for head max simiality threshold
-
-    # Max similarity threshold means that we will not add any new heads until there exists pair of heads
-    # with similarity value lower than the threshold. This promotes the model to learn different heads and
-    # gradually allows for more similarity as the training progresses.
-
-    t_0 = 0.4  # initial threshold
-    t_1 = 0.9  # final threshold
-    t = iter_num / max_iters
-    return t_0 + (t_1 - t_0) * (1 - math.cos(math.pi * t)) / 2
 
 
 # logging
@@ -490,7 +369,10 @@ if wandb_log and master_process:
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
     wandb.watch(model, log_freq=log_interval)
 
-X_sim, Y_sim = get_batch("val")  # fetch the very first batch for similarity
+X_sim, Y_sim = (
+    torch.cat(x, dim=0) for x in zip(*[get_batch("val") for _ in range(5)])
+)  # fetch 5 batches for similarity estimation
+
 
 # training loop
 X, Y = get_batch("train")  # fetch the very first batch
@@ -503,12 +385,22 @@ last_time_heads_added = [
 ]  # when was the last time we added new heads
 last_time_heads_added_fraction = 0.1
 copy_heads = (
-    True  # whether to copy the heads from the previous layer when adding new heads
+    False  # whether to copy the heads from the previous layer when adding new heads
 )
+print(model)
+lr_scheduler = wsd_schedule(
+    n_iterations=max_iters,
+    final_lr_factor=0.1,
+    fract_warmup=0.1,
+    init_div_factor=100,
+    fract_decay=0.2,
+    decay_type="sqrt",
+)
+attn_head_sim_scheduler = head_max_similarity_schedule(max_iters, 0.3, 0.9)
 while True:
 
     local_model = model.module if ddp else model  # unwrap DDP container if needed
-    if attention_layer == "selective":
+    if attention_layer == "selective" and modify_number_of_heads:
         for i, layer in enumerate(local_model.transformer.h):
             # check if we need to add new heads in this layer
             if (
@@ -536,7 +428,7 @@ while True:
                 add_new_heads[i] = False
 
     # determine and set the learning rate for this iteration
-    lr = get_lr(iter_num) if decay_lr else learning_rate
+    lr = learning_rate * lr_scheduler(iter_num) if decay_lr else learning_rate
     for param_group in optimizer.param_groups:
         param_group["lr"] = lr
 
@@ -555,73 +447,143 @@ while True:
             if attn is not None:
                 log_data.update(
                     {
-                        f"cka/block_{i}": attn["cka_per_block"][i]
-                        for i in range(len(attn["cka_per_block"]))
+                        f"cka/layer_{i}": attn["cka_mean_redundancy_per_layer"][i]
+                        for i in range(len(attn["cka_mean_redundancy_per_layer"]))
                     }
                 )
                 log_data.update(
                     {
-                        f"cossim/block_{i}": attn["cossim_per_block"][i]
-                        for i in range(len(attn["cossim_per_block"]))
+                        f"cossim/layer_{i}": attn["cossim_mean_redundancy_per_layer"][i]
+                        for i in range(len(attn["cossim_mean_redundancy_per_layer"]))
                     }
                 )
                 log_data.update(
                     {
-                        f"cka/std_block_{i}": attn["cka_std_per_block"][i]
-                        for i in range(len(attn["cka_std_per_block"]))
+                        f"cka/std_layer_{i}": attn["cka_std_redundancy_per_layer"][i]
+                        for i in range(len(attn["cka_std_redundancy_per_layer"]))
                     }
                 )
                 log_data.update(
                     {
-                        f"cossim/std_block_{i}": attn["cossim_std_per_block"][i]
-                        for i in range(len(attn["cossim_std_per_block"]))
+                        f"cossim/std_layer_{i}": attn[
+                            "cossim_std_redundancy_per_layer"
+                        ][i]
+                        for i in range(len(attn["cossim_std_redundancy_per_layer"]))
                     }
                 )
                 log_data.update(
                     {
-                        f"cka/max_block_{i}": attn["cka_max_per_block"][i]
-                        for i in range(len(attn["cka_max_per_block"]))
+                        f"cka/max_layer_{i}": attn["cka_max_redundancy_per_layer"][i]
+                        for i in range(len(attn["cka_max_redundancy_per_layer"]))
                     }
                 )
                 log_data.update(
                     {
-                        f"cossim/max_block_{i}": attn["cossim_max_per_block"][i]
-                        for i in range(len(attn["cossim_max_per_block"]))
+                        f"cossim/max_layer_{i}": attn[
+                            "cossim_max_redundancy_per_layer"
+                        ][i]
+                        for i in range(len(attn["cossim_max_redundancy_per_layer"]))
                     }
                 )
 
-                for block_id in range(len(attn["cka"])):
-                    log_similarity_heatmap(
-                        attn["cka"][block_id],
+                for layer_id in range(len(attn["cka"])):
+                    name = f"cka_similarity_S/layer_{layer_id}"
+                    fig = get_similarity_heatmap(
+                        attn["cka"][layer_id],
                         step=iter_num,
-                        name=f"cka_heatmap/block_{block_id}",
+                        name=name,
+                        plot_title=r"Pairwise CKA Similarity $\mathbf{S}$"
+                        + f"\nLayer: {layer_id}, step: {iter_num}",
+                        out_dir=out_dir,
                     )
-                    log_similarity_heatmap(
-                        attn["cossim"][block_id],
-                        step=iter_num,
-                        name=f"cossim_heatmap/block_{block_id}",
-                    )
+                    wandb.log({name: wandb.Image(fig)}, step=iter_num)
+                    plt.close(fig)
 
-                    head_sim_th = get_head_max_similarity_threshold(iter_num)
-                    if attn["cka_max_per_block"][block_id] < head_sim_th:
-                        add_new_heads[block_id] = True
+                    name = f"cossim_similarity_S/layer_{layer_id}"
+                    fig = get_similarity_heatmap(
+                        attn["cossim"][layer_id],
+                        step=iter_num,
+                        name=name,
+                        plot_title=r"Pairwise Cosine Similarity $\mathbf{S}$"
+                        + f"\nLayer: {layer_id}, step: {iter_num}",
+                        out_dir=out_dir,
+                    )
+                    wandb.log({name: wandb.Image(fig)}, step=iter_num)
+                    plt.close(fig)
+
+                    head_sim_th = attn_head_sim_scheduler(iter_num)
+                    if attn["cka_max_redundancy_per_layer"][layer_id] < head_sim_th:
+                        add_new_heads[layer_id] = True
+
+                    # compute similarity in the weight space
+                    with torch.no_grad():
+                        _attn = local_model.transformer.h[layer_id].attn
+                        Wqks = []
+                        for i in _attn.trainable_heads:
+                            Wk = _attn.c_attn.weight[
+                                0 * _attn.n_embd
+                                + i * _attn.head_dim : 0 * _attn.n_embd
+                                + (i + 1) * _attn.head_dim,
+                                :,
+                            ]
+                            Wq = _attn.c_attn.weight[
+                                1 * _attn.n_embd
+                                + i * _attn.head_dim : 1 * _attn.n_embd
+                                + (i + 1) * _attn.head_dim,
+                                :,
+                            ]
+                            Wqks.append(Wq @ Wk.T)
+                        stacked_Wqk = torch.stack(Wqks, dim=0).unsqueeze(
+                            0
+                        )  # shape (1, n_heads, head_dim, head_dim)
+
+                        S_cka_wqk = compute_pairwise_symmetric_similarity_matrix(
+                            stacked_Wqk, lambda x, y: cka(x, y, biased_hsic)
+                        )
+                        name = f"cka_heatmap_for_weights/layer_{layer_id}"
+                        fig = get_similarity_heatmap(
+                            S_cka_wqk,
+                            step=iter_num,
+                            name=name,
+                            plot_title=r"Pairwise CKA Similarity $\mathbf{QK}^T$"
+                            + f"\nLayer: {layer_id}, step: {iter_num}",
+                            out_dir=out_dir,
+                        )
+                        wandb.log({name: wandb.Image(fig)}, step=iter_num)
+                        plt.close(fig)
 
                 mean_per_head_sims = [
-                    compute_mean_per_head_similarities(attn["cka"][i])
+                    compute_mean_per_head_redundancy(attn["cka"][i])
                     for i in range(len(attn["cka"]))
                 ]
 
                 max_per_head_sims = [
-                    compute_max_per_head_similarities(attn["cka"][i])
+                    compute_max_per_head_redundancy(attn["cka"][i])
                     for i in range(len(attn["cka"]))
                 ]
 
-                log_per_head_model_heatmap(
-                    mean_per_head_sims, iter_num, "cka_per_head/mean_model_head_heatmap"
+                name = "cka_per_head/mean_head_redundancy_heatmap"
+                fig = get_per_head_model_heatmap(
+                    mean_per_head_sims,
+                    iter_num,
+                    name,
+                    out_dir,
+                    plot_title=f"Mean Head Redundancy Heatmap\nLayer: {layer_id}, step: {iter_num}",
                 )
-                log_per_head_model_heatmap(
-                    max_per_head_sims, iter_num, "cka_per_head/max_model_head_heatmap"
+                wandb.log({name: wandb.Image(fig)}, step=iter_num)
+                plt.close(fig)
+
+                name = "cka_per_head/max_head_redundancy_heatmap"
+                fig = get_per_head_model_heatmap(
+                    max_per_head_sims,
+                    iter_num,
+                    name,
+                    out_dir,
+                    plot_title=f"Max Head Redundancy Heatmap\nLayer: {layer_id}, step: {iter_num}",
                 )
+                wandb.log({name: wandb.Image(fig)}, step=iter_num)
+                plt.close(fig)
+                name = None
 
             wandb.log(log_data, step=iter_num)
 
@@ -641,6 +603,8 @@ while True:
     if iter_num == 0 and eval_only:
         break
 
+    t_forward = 0
+    t_backward = 0
     t0 = time.time()
     # Add the attention head splitting
     # The idea is that we only backprop through and train only one half of the attention heads
@@ -649,6 +613,7 @@ while True:
     # forward backward update, with optional gradient accumulation to simulate larger batch size
     # and using the GradScaler if data type is float16
     for micro_step in range(gradient_accumulation_steps):
+        t_forward_0 = time.time()
         if ddp:
             # in DDP training we only need to sync gradients at the last micro step.
             # the official way to do this is with model.no_sync() context manager, but
@@ -659,13 +624,17 @@ while True:
             )
         with ctx:
             logits, loss = model(X, Y)
+            t_forward += time.time() - t_forward_0
+
             loss = (
                 loss / gradient_accumulation_steps
             )  # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y = get_batch("train")
         # backward pass, with gradient scaling if training in fp16
+        t_backward_0 = time.time()
         scaler.scale(loss).backward()
+        t_backward += time.time() - t_backward_0
     # clip the gradient
     if grad_clip != 0.0:
         scaler.unscale_(optimizer)
@@ -687,7 +656,7 @@ while True:
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9 * running_mfu + 0.1 * mfu
         print(
-            f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%"
+            f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%, time forward {((t_forward)*1000):.2f}ms, time backward {((t_backward)*1000):.2f}ms"
         )
         if wandb_log:
             wandb.log(
@@ -697,9 +666,7 @@ while True:
                     "iter_time": dt * 1000,
                     "lr": lr,
                     "mfu": running_mfu * 100,  # convert to percentage
-                    "head_max_similarity_threshold": get_head_max_similarity_threshold(
-                        iter_num
-                    ),
+                    "head_max_similarity_threshold": attn_head_sim_scheduler(iter_num),
                 },
                 step=iter_num,
             )
