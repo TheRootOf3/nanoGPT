@@ -12,6 +12,8 @@ def biased_hsic(gram1, gram2):
     h = (
         torch.eye(gram1.shape[0])
         - torch.ones(gram1.shape[0], gram1.shape[0]) / gram1.shape[0]
+    ).to(
+        gram1.device
     )  # centering matrix
 
     # compute the HSIC value
@@ -151,7 +153,7 @@ def compute_aggr_pairwise_similarity(
     return aggregate_fn(upper_tri_values).item()
 
 
-def compute_mean_per_head_similarities(
+def compute_mean_per_head_redundancy(
     sim_matrix: torch.Tensor,
 ) -> torch.Tensor:
     """
@@ -170,7 +172,7 @@ def compute_mean_per_head_similarities(
     return per_head_similarities
 
 
-def compute_max_per_head_similarities(
+def compute_max_per_head_redundancy(
     sim_matrix: torch.Tensor,
 ) -> torch.Tensor:
     """
