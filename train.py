@@ -63,7 +63,7 @@ dataset = "openwebtext"
 gradient_accumulation_steps = 5 * 8  # used to simulate larger batch sizes
 batch_size = 12  # if gradient_accumulation_steps > 1, this is the micro-batch size
 # model - 124M GPT-2
-d_model = 1024
+max_seq_length = 1024
 n_layer = 12
 n_head = 12
 n_embd = 768
@@ -97,6 +97,8 @@ attention_layer = "causal"  # 'selective'
 output_attentions = False  # whether to output attention weights for each layer
 override_checkpoint = True
 modify_number_of_heads = False
+scheduler_type = "cosine"
+SEED = 1337
 
 # -----------------------------------------------------------------------------
 config_keys = [
@@ -142,14 +144,16 @@ else:
     master_process = True
     seed_offset = 0
     ddp_world_size = 1
-tokens_per_iter = gradient_accumulation_steps * ddp_world_size * batch_size * d_model
+tokens_per_iter = (
+    gradient_accumulation_steps * ddp_world_size * batch_size * max_seq_length
+)
 print(f"tokens per iteration will be: {tokens_per_iter:,}")
 print(f"max num of iterations will be: {int(max_iters)}")
 print(f"num of warmup iterations will be: {int(warmup_iters)}")
 
 if master_process:
     os.makedirs(os.path.join(out_dir, "plots"), exist_ok=True)
-torch.manual_seed(1337 + seed_offset)
+torch.manual_seed(SEED + seed_offset)
 torch.backends.cuda.matmul.allow_tf32 = True  # allow tf32 on matmul
 torch.backends.cudnn.allow_tf32 = True  # allow tf32 on cudnn
 device_type = "cuda" if "cuda" in device else "cpu"  # for later use in torch.autocast
@@ -169,19 +173,33 @@ ctx = (
 data_dir = os.path.join("data", dataset)
 
 
-def get_batch(split):
+def get_batch(split, ix=None):
+    """Get a small batch of data from the dataset.
+
+    Args:
+        split (str): 'train' or 'val', which split to get the batch from.
+        ix (torch.Tensor, optional): indices to sample from the dataset. If None, random indices are used.
+
+    Returns:
+        tuple: A tuple containing two tensors, x and y, where:
+            - x: input tensor of shape (batch_size, max_seq_length)
+            - y: target tensor of shape (batch_size, max_seq_length)
+    """
     # We recreate np.memmap every batch to avoid a memory leak, as per
     # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
     if split == "train":
         data = np.memmap(os.path.join(data_dir, "train.bin"), dtype=np.uint16, mode="r")
     else:
         data = np.memmap(os.path.join(data_dir, "val.bin"), dtype=np.uint16, mode="r")
-    ix = torch.randint(len(data) - d_model, (batch_size,))
+    ix = torch.randint(len(data) - max_seq_length, (batch_size,)) if ix is None else ix
     x = torch.stack(
-        [torch.from_numpy((data[i : i + d_model]).astype(np.int64)) for i in ix]
+        [torch.from_numpy((data[i : i + max_seq_length]).astype(np.int64)) for i in ix]
     )
     y = torch.stack(
-        [torch.from_numpy((data[i + 1 : i + 1 + d_model]).astype(np.int64)) for i in ix]
+        [
+            torch.from_numpy((data[i + 1 : i + 1 + max_seq_length]).astype(np.int64))
+            for i in ix
+        ]
     )
     if device_type == "cuda":
         # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
@@ -211,7 +229,7 @@ model_args = dict(
     n_layer=n_layer,
     n_head=n_head,
     n_embd=n_embd,
-    block_size=d_model,
+    block_size=max_seq_length,
     bias=bias,
     vocab_size=None,
     dropout=dropout,
@@ -229,42 +247,12 @@ if init_from == "scratch":
     model_args["vocab_size"] = meta_vocab_size if meta_vocab_size is not None else 50304
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
-elif init_from == "resume":
-    print(f"Resuming training from {out_dir}")
-    # resume training from a checkpoint.
-    ckpt_path = os.path.join(out_dir, "ckpt.pt")
-    checkpoint = torch.load(ckpt_path, map_location=device)
-    checkpoint_model_args = checkpoint["model_args"]
-    # force these config attributes to be equal otherwise we can't even resume training
-    # the rest of the attributes (e.g. dropout) can stay as desired from command line
-    for k in ["n_layer", "n_head", "n_embd", "block_size", "bias", "vocab_size"]:
-        model_args[k] = checkpoint_model_args[k]
-    # create the model
-    gptconf = GPTConfig(**model_args)
-    model = GPT(gptconf)
-    state_dict = checkpoint["model"]
-    # fix the keys of the state dictionary :(
-    # honestly no idea how checkpoints sometimes get this prefix, have to debug more
-    unwanted_prefix = "_orig_mod."
-    for k, v in list(state_dict.items()):
-        if k.startswith(unwanted_prefix):
-            state_dict[k[len(unwanted_prefix) :]] = state_dict.pop(k)
-    model.load_state_dict(state_dict)
-    iter_num = checkpoint["iter_num"]
-    best_val_loss = checkpoint["best_val_loss"]
-elif init_from.startswith("gpt2"):
-    print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
-    # initialize from OpenAI GPT-2 weights
-    override_args = dict(dropout=dropout)
-    model = GPT.from_pretrained(init_from, override_args)
-    # read off the created config params, so we can store them into checkpoint correctly
-    for k in ["n_layer", "n_head", "n_embd", "block_size", "bias", "vocab_size"]:
-        model_args[k] = getattr(model.config, k)
+
 # crop down the model block size if desired, using model surgery
-if d_model < model.config.block_size:
-    model.crop_block_size(d_model)
+if max_seq_length < model.config.block_size:
+    model.crop_block_size(max_seq_length)
     model_args["block_size"] = (
-        d_model  # so that the checkpoint will have the right value
+        max_seq_length  # so that the checkpoint will have the right value
     )
 model.to(device)
 
@@ -275,15 +263,7 @@ scaler = torch.cuda.amp.GradScaler(enabled=(dtype == "float16"))
 optimizer = model.configure_optimizers(
     weight_decay, learning_rate, (beta1, beta2), device_type
 )
-if init_from == "resume":
-    optimizer.load_state_dict(checkpoint["optimizer"])
-checkpoint = None  # free up memory
-
-# compile the model
-if compile:
-    print("compiling the model... (takes a ~minute)")
-    unoptimized_model = model
-    model = torch.compile(model)  # requires PyTorch 2.0
+checkpoint = None
 
 # wrap model into DDP container
 if ddp:
@@ -293,6 +273,12 @@ if ddp:
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
 def estimate_loss():
+    """Estimate the loss on the train and val splits.
+
+    Returns:
+        dict: A dictionary with keys 'train' and 'val', containing the mean loss for each split.
+    """
+
     out = {}
     model.eval()
     for split in ["train", "val"]:
@@ -310,6 +296,16 @@ def estimate_loss():
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
 def estimate_attention_head_similarity(X_sim, Y_sim):
+    """Estimate the attention head similarity using CKA and cosine similarity.
+
+    Args:
+        X_sim (torch.Tensor): Input tensor for similarity estimation.
+        Y_sim (torch.Tensor): Target tensor for similarity estimation.
+
+    Returns:
+        dict: A dictionary containing CKA and cosine similarity results for each layer.
+    """
+
     out = {}
     model.eval()
     n_layer = gptconf.n_layer  # number of layers in the model
@@ -337,6 +333,8 @@ def estimate_attention_head_similarity(X_sim, Y_sim):
             SplitCausalSelfAttentionVariableNumHeadsIndependent,
         ):
             head_idx.append(local_model.transformer.h[layer_idx].attn.trainable_heads)
+    del attn_weights  # free up memory
+    torch.cuda.empty_cache()  # free up memory
 
     out["cka_mean_redundancy_per_layer"] = [
         compute_aggr_pairwise_similarity(S, torch.mean) for S in cka_results
@@ -369,8 +367,23 @@ if wandb_log and master_process:
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
     wandb.watch(model, log_freq=log_interval)
 
+NUM_SIMILARITY_EVAL_BATCHES = 1  # number of batches to use for similarity estimation
 X_sim, Y_sim = (
-    torch.cat(x, dim=0) for x in zip(*[get_batch("val") for _ in range(5)])
+    torch.cat(x, dim=0)
+    for x in zip(
+        *[
+            get_batch(
+                "val",
+                torch.Tensor(
+                    [
+                        j * max_seq_length * batch_size + i * max_seq_length
+                        for i in range(batch_size)
+                    ]
+                ).to(torch.int64),
+            )
+            for j in range(NUM_SIMILARITY_EVAL_BATCHES)
+        ]
+    )
 )  # fetch 5 batches for similarity estimation
 
 
@@ -379,6 +392,8 @@ X, Y = get_batch("train")  # fetch the very first batch
 local_iter_num = 0  # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model  # unwrap DDP container if needed
 running_mfu = -1.0
+
+# SMHA hyperparameters
 add_new_heads = [False for _ in range(gptconf.n_layer)]
 last_time_heads_added = [
     0 for _ in range(gptconf.n_layer)
@@ -388,20 +403,33 @@ copy_heads = (
     False  # whether to copy the heads from the previous layer when adding new heads
 )
 print(model)
-lr_scheduler = wsd_schedule(
-    n_iterations=max_iters,
-    final_lr_factor=0.1,
-    fract_warmup=0.1,
-    init_div_factor=100,
-    fract_decay=0.2,
-    decay_type="sqrt",
+
+lr_scheduler = (
+    wsd_schedule(
+        n_iterations=max_iters,
+        final_lr_factor=0.1,
+        fract_warmup=warmup_iters / max_iters,
+        init_div_factor=100,
+        fract_decay=0.2,
+        decay_type="sqrt",
+    )
+    if scheduler_type == "wsd"
+    else wsd_schedule(
+        n_iterations=max_iters,
+        final_lr_factor=0.1,
+        fract_warmup=warmup_iters / max_iters,
+        init_div_factor=100,
+        fract_decay=1 - warmup_iters / max_iters,
+        decay_type="cosine",
+    )
 )
+
+
 attn_head_sim_scheduler = head_max_similarity_schedule(max_iters, 0.3, 0.9)
 while True:
 
-    local_model = model.module if ddp else model  # unwrap DDP container if needed
     if attention_layer == "selective" and modify_number_of_heads:
-        for i, layer in enumerate(local_model.transformer.h):
+        for i, layer in enumerate(raw_model.transformer.h):
             # check if we need to add new heads in this layer
             if (
                 add_new_heads[i]
@@ -515,9 +543,9 @@ while True:
                     if attn["cka_max_redundancy_per_layer"][layer_id] < head_sim_th:
                         add_new_heads[layer_id] = True
 
-                    # compute similarity in the weight space
+                    # # compute similarity in the weight space
                     with torch.no_grad():
-                        _attn = local_model.transformer.h[layer_id].attn
+                        _attn = raw_model.transformer.h[layer_id].attn
                         Wqks = []
                         for i in _attn.trainable_heads:
                             Wk = _attn.c_attn.weight[
@@ -545,7 +573,7 @@ while True:
                             S_cka_wqk,
                             step=iter_num,
                             name=name,
-                            plot_title=r"Pairwise CKA Similarity $\mathbf{QK}^T$"
+                            plot_title=r"Pairwise CKA Similarity $\mathbf{W_QW_K}^T$"
                             + f"\nLayer: {layer_id}, step: {iter_num}",
                             out_dir=out_dir,
                         )
@@ -568,7 +596,7 @@ while True:
                     iter_num,
                     name,
                     out_dir,
-                    plot_title=f"Mean Head Redundancy Heatmap\nLayer: {layer_id}, step: {iter_num}",
+                    plot_title=f"Mean Head Redundancy Heatmap\nStep: {iter_num}",
                 )
                 wandb.log({name: wandb.Image(fig)}, step=iter_num)
                 plt.close(fig)
@@ -579,7 +607,7 @@ while True:
                     iter_num,
                     name,
                     out_dir,
-                    plot_title=f"Max Head Redundancy Heatmap\nLayer: {layer_id}, step: {iter_num}",
+                    plot_title=f"Max Head Redundancy Heatmap\nStep: {iter_num}",
                 )
                 wandb.log({name: wandb.Image(fig)}, step=iter_num)
                 plt.close(fig)
@@ -600,6 +628,13 @@ while True:
             print(f"saving checkpoint to {out_dir}")
             name = "ckpt.pt" if override_checkpoint else f"ckpt_{iter_num}.pt"
             torch.save(checkpoint, os.path.join(out_dir, name))
+
+            # model.to_huggingface().save_pretrained(
+            #     os.path.join(
+            #         out_dir,
+            #         "hf_model" if override_checkpoint else f"hf_model_{iter_num}",
+            #     )
+            # )
     if iter_num == 0 and eval_only:
         break
 
