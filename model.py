@@ -521,6 +521,94 @@ class GPT(nn.Module):
 
         return model
 
+    def to_huggingface(self):
+        """
+        Convert this model to a huggingface GPT2LMHeadModel.
+        Returns a huggingface/transformers model initialized with the weights from this model.
+        """
+        from transformers import GPT2LMHeadModel, GPT2Config
+
+        # Determine model type based on our configuration
+        n_layer, n_head, n_embd = (
+            self.config.n_layer,
+            self.config.n_head,
+            self.config.n_embd,
+        )
+        model_type = None
+        for mtype, cfg in {
+            "gpt2": dict(n_layer=12, n_head=12, n_embd=768),
+            "gpt2-medium": dict(n_layer=24, n_head=16, n_embd=1024),
+            "gpt2-large": dict(n_layer=36, n_head=20, n_embd=1280),
+            "gpt2-xl": dict(n_layer=48, n_head=25, n_embd=1600),
+        }.items():
+            if (
+                cfg["n_layer"] == n_layer
+                and cfg["n_head"] == n_head
+                and cfg["n_embd"] == n_embd
+            ):
+                model_type = mtype
+                break
+
+        if model_type is None:
+            print("Warning: Model configuration doesn't match any standard GPT-2 model")
+            model_type = "custom-gpt2"
+
+        print(f"Converting to huggingface model: {model_type}")
+
+        # Create a huggingface config with our parameters
+        hf_config = GPT2Config(
+            vocab_size=self.config.vocab_size,
+            n_positions=self.config.block_size,
+            n_embd=self.config.n_embd,
+            n_layer=self.config.n_layer,
+            n_head=self.config.n_head,
+            activation_function="gelu_new",
+            resid_pdrop=self.config.dropout,
+            embd_pdrop=self.config.dropout,
+            attn_pdrop=self.config.dropout,
+            layer_norm_epsilon=1e-5,
+            initializer_range=0.02,
+            use_cache=True,
+        )
+
+        # Create the huggingface model
+        model_hf = GPT2LMHeadModel(hf_config)
+
+        # Get both model's state dictionaries
+        sd = self.state_dict()
+        sd_hf = model_hf.state_dict()
+
+        # Copy parameters, handling transposed weights
+        transposed = [
+            "attn.c_attn.weight",
+            "attn.c_proj.weight",
+            "mlp.c_fc.weight",
+            "mlp.c_proj.weight",
+        ]
+
+        for k_hf in sd_hf:
+            if k_hf.endswith(".attn.masked_bias") or k_hf.endswith(".attn.bias"):
+                # Skip buffers
+                continue
+
+            # Find corresponding key in our model
+            k = k_hf
+
+            if k not in sd and not any(k.endswith(w) for w in transposed):
+                print(f"Warning: Key {k} not found in source model")
+                continue
+
+            if any(k.endswith(w) for w in transposed):
+                # Handle transposition (opposite of from_pretrained)
+                with torch.no_grad():
+                    sd_hf[k_hf].copy_(sd[k].t())
+            else:
+                # Direct copy
+                with torch.no_grad():
+                    sd_hf[k_hf].copy_(sd[k])
+
+        return model_hf
+
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
         # start with all of the candidate parameters
         param_dict = {pn: p for pn, p in self.named_parameters()}
