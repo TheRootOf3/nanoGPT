@@ -7,7 +7,7 @@ wandb_project = "owt"
 wandb_run_name = "gpt2-124M"
 
 # model - 16M GPT-2
-block_size = 8192
+max_seq_length = 8192
 n_layer = 16
 n_head = 32
 n_embd = 2048

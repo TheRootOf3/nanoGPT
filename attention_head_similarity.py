@@ -7,8 +7,15 @@ import torch.nn.functional as F
 def biased_hsic(gram1, gram2):
     """
     Computes the Hilbert-Schmidt Independence Criterion (HSIC) between two attention maps.
-    """
+    This implementation is biased, meaning it does not center the Gram matrices.
 
+    Args:
+        gram1 (torch.Tensor): The Gram matrix of the first attention map.
+        gram2 (torch.Tensor): The Gram matrix of the second attention map.
+
+    Returns:
+        torch.Tensor: The HSIC value between the two Gram matrices.
+    """
     h = (
         torch.eye(gram1.shape[0])
         - torch.ones(gram1.shape[0], gram1.shape[0]) / gram1.shape[0]
@@ -22,6 +29,16 @@ def biased_hsic(gram1, gram2):
 
 
 def unbiased_hsic(gram1, gram2):
+    """
+    Computes the unbiased Hilbert-Schmidt Independence Criterion (HSIC) between two attention maps.
+    This implementation centers the Gram matrices before computing the HSIC value.
+
+    Args:
+        gram1 (torch.Tensor): The Gram matrix of the first attention map.
+        gram2 (torch.Tensor): The Gram matrix of the second attention map.
+    Returns:
+        torch.Tensor: The unbiased HSIC value between the two Gram matrices.
+    """
     gram1_copy = gram1.clone()
     gram2_copy = gram2.clone()
 
@@ -42,7 +59,17 @@ def cka(
     hsic_fn: callable = unbiased_hsic,
 ):
     """
-    Computes the Centered Kernel Alignment (CKA) between two attention maps.
+    Computes the Centered Kernel Alignment (CKA) between two attention maps or lists of attention maps.
+    CKA is a measure of similarity between two sets of representations, often used to compare attention heads.
+
+    Args:
+        attn1 (torch.Tensor | list[torch.Tensor]): The first attention map or a list of attention maps.
+        attn2 (torch.Tensor | list[torch.Tensor]): The second attention map or a list of attention maps.
+        hsic_fn (callable): The function to compute the Hilbert-Schmidt Independence Criterion (HSIC).
+                            Defaults to unbiased_hsic.
+
+    Returns:
+        float: The CKA value between the two attention maps or lists of attention maps.
     """
     if len(attn1.shape) == 2:
         attn1 = [attn1]
@@ -64,7 +91,17 @@ def cka(
     return (hsic_kl / torch.sqrt(hsic_kk * hsic_ll)).item()
 
 
-def cosine_similarity(attn1, attn2):
+def cosine_similarity(attn1: torch.Tensor, attn2: torch.Tensor) -> float:
+    """
+    Computes the cosine similarity between two attention maps or lists of attention maps.
+
+    Args:
+        attn1 (torch.Tensor): The first attention map or a list of attention maps.
+        attn2 (torch.Tensor): The second attention map or a list of attention maps.
+
+    Returns:
+        float: The cosine similarity value between the two attention maps or lists of attention maps.
+    """
     attn1 = attn1.reshape(attn1.shape[0], -1)
     attn2 = attn2.reshape(attn2.shape[0], -1)
 
@@ -79,7 +116,7 @@ def aggregate_head_pairwise_metric_batch(
     """
     Computes a pairwise metric (e.g., CKA, HSIC) for all head pairs in the attention weights.
 
-    Parameters:
+    Args:
         attn_weights (torch.Tensor): Attention weights of shape (batch_size, n_heads, seq_len, seq_len).
         metric_fn (callable): Function to compute the pairwise metric.
         aggregate_fn (callable, optional): Function to aggregate the results across head pairs. If not provided, return the metric results.
@@ -110,9 +147,10 @@ def compute_pairwise_symmetric_similarity_matrix(
     It assumes that the metric function is symmetric, meaning that the order of inputs does not matter.
     NOTE: The diagonal of the matrix is filled with ones, representing self-similarity.
 
-    Parameters:
+    Args:
         attn_weights (torch.Tensor): Attention weights of shape (batch_size, n_heads, seq_len, seq_len).
         metric_fn (callable): Function to compute the pairwise metric. It must be symmetric.
+
     Returns:
         torch.Tensor: A symmetric matrix of shape (n_heads, n_heads) containing the pairwise metric values.
     """
@@ -139,7 +177,7 @@ def compute_aggr_pairwise_similarity(
     """
     Computes the aggregated pairwise similarity from a symmetric matrix of shape (n_heads, n_heads).
 
-    Parameters:
+    Args:
         sim_matrix (torch.Tensor): A symmetric matrix of shape (n_heads, n_heads) containing pairwise similarity values.
         aggregate_fn (callable, optional): Function to aggregate the results across head pairs. If not provided, the mean of the upper triangular part is returned.
 
@@ -158,8 +196,10 @@ def compute_mean_per_head_redundancy(
 ) -> torch.Tensor:
     """
     Computes mean similarity values for a specific head across all other heads.
-    Parameters:
+
+    Args:
         sim_matrix (torch.Tensor): A symmetric matrix of shape (n_heads, n_heads) containing pairwise similarity values.
+
     Returns:
         torch.Tensor: A tensor of shape (n_heads,) containing the similarity values for each head.
     """
@@ -177,8 +217,10 @@ def compute_max_per_head_redundancy(
 ) -> torch.Tensor:
     """
     Computes max similarity values for a specific head across all other heads.
-    Parameters:
+
+    Args:
         sim_matrix (torch.Tensor): A symmetric matrix of shape (n_heads, n_heads) containing pairwise similarity values.
+
     Returns:
         torch.Tensor: A tensor of shape (n_heads,) containing the similarity values for each head.
     """
